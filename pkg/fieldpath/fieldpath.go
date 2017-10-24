@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,15 +18,17 @@ package fieldpath
 
 import (
 	"fmt"
+	"strings"
 
-	"k8s.io/kubernetes/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/meta"
 )
 
-// formatMap formats map[string]string to a string.
-func formatMap(m map[string]string) (fmtStr string) {
+// FormatMap formats map[string]string to a string.
+func FormatMap(m map[string]string) (fmtStr string) {
 	for key, value := range m {
 		fmtStr += fmt.Sprintf("%v=%q\n", key, value)
 	}
+	fmtStr = strings.TrimSuffix(fmtStr, "\n")
 
 	return
 }
@@ -34,11 +36,6 @@ func formatMap(m map[string]string) (fmtStr string) {
 // ExtractFieldPathAsString extracts the field from the given object
 // and returns it as a string.  The object must be a pointer to an
 // API type.
-//
-// Currently, this API is limited to supporting the fieldpaths:
-//
-// 1.  metadata.name - The name of an API object
-// 2.  metadata.namespace - The namespace of an API object
 func ExtractFieldPathAsString(obj interface{}, fieldPath string) (string, error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
@@ -47,14 +44,16 @@ func ExtractFieldPathAsString(obj interface{}, fieldPath string) (string, error)
 
 	switch fieldPath {
 	case "metadata.annotations":
-		return formatMap(accessor.GetAnnotations()), nil
+		return FormatMap(accessor.GetAnnotations()), nil
 	case "metadata.labels":
-		return formatMap(accessor.GetLabels()), nil
+		return FormatMap(accessor.GetLabels()), nil
 	case "metadata.name":
 		return accessor.GetName(), nil
 	case "metadata.namespace":
 		return accessor.GetNamespace(), nil
+	case "metadata.uid":
+		return string(accessor.GetUID()), nil
 	}
 
-	return "", fmt.Errorf("Unsupported fieldPath: %v", fieldPath)
+	return "", fmt.Errorf("unsupported fieldPath: %v", fieldPath)
 }

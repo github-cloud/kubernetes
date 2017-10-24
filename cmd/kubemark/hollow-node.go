@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,23 +18,26 @@ package main
 
 import (
 	"fmt"
-	"runtime"
 
-	docker "github.com/fsouza/go-dockerclient"
-
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	clientset "k8s.io/kubernetes/pkg/client/unversioned/adapters/internalclientset"
-	"k8s.io/kubernetes/pkg/client/unversioned/clientcmd"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/util/flag"
+	clientgoclientset "k8s.io/client-go/kubernetes"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
 	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
-	"k8s.io/kubernetes/pkg/kubelet/dockertools"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/libdocker"
 	"k8s.io/kubernetes/pkg/kubemark"
-	proxyconfig "k8s.io/kubernetes/pkg/proxy/config"
-	"k8s.io/kubernetes/pkg/util/flag"
 	fakeiptables "k8s.io/kubernetes/pkg/util/iptables/testing"
-	"k8s.io/kubernetes/pkg/util/sets"
+	fakesysctl "k8s.io/kubernetes/pkg/util/sysctl/testing"
+	_ "k8s.io/kubernetes/pkg/version/prometheus" // for version metric registration
+	fakeexec "k8s.io/utils/exec/testing"
 
 	"github.com/golang/glog"
 	"github.com/spf13/pflag"
@@ -47,10 +50,13 @@ type HollowNodeConfig struct {
 	Morph               string
 	NodeName            string
 	ServerPort          int
+	ContentType         string
+	UseRealProxier      bool
 }
 
 const (
-	maxPods = 110
+	maxPods     = 110
+	podsPerCore = 0
 )
 
 var knownMorphs = sets.NewString("kubelet", "proxy")
@@ -62,27 +68,26 @@ func (c *HollowNodeConfig) addFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.NodeName, "name", "fake-node", "Name of this Hollow Node.")
 	fs.IntVar(&c.ServerPort, "api-server-port", 443, "Port on which API server is listening.")
 	fs.StringVar(&c.Morph, "morph", "", fmt.Sprintf("Specifies into which Hollow component this binary should morph. Allowed values: %v", knownMorphs.List()))
+	fs.StringVar(&c.ContentType, "kube-api-content-type", "application/vnd.kubernetes.protobuf", "ContentType of requests sent to apiserver.")
+	fs.BoolVar(&c.UseRealProxier, "use-real-proxier", true, "Set to true if you want to use real proxier inside hollow-proxy.")
 }
 
-func createClientFromFile(path string) (*client.Client, error) {
-	c, err := clientcmd.LoadFromFile(path)
+func (c *HollowNodeConfig) createClientConfigFromFile() (*restclient.Config, error) {
+	clientConfig, err := clientcmd.LoadFromFile(c.KubeconfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("error while loading kubeconfig from file %v: %v", path, err)
+		return nil, fmt.Errorf("error while loading kubeconfig from file %v: %v", c.KubeconfigPath, err)
 	}
-	config, err := clientcmd.NewDefaultClientConfig(*c, &clientcmd.ConfigOverrides{}).ClientConfig()
+	config, err := clientcmd.NewDefaultClientConfig(*clientConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("error while creating kubeconfig: %v", err)
 	}
-	client, err := client.New(config)
-	if err != nil {
-		return nil, fmt.Errorf("error while creating client: %v", err)
-	}
-	return client, nil
+	config.ContentType = c.ContentType
+	config.QPS = 10
+	config.Burst = 20
+	return config, nil
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	config := HollowNodeConfig{}
 	config.addFlags(pflag.CommandLine)
 	flag.InitFlags()
@@ -92,18 +97,26 @@ func main() {
 	}
 
 	// create a client to communicate with API server.
-	cl, err := createClientFromFile(config.KubeconfigPath)
-	clientset := clientset.FromUnversionedClient(cl)
+	clientConfig, err := config.createClientConfigFromFile()
 	if err != nil {
-		glog.Fatal("Failed to create a Client. Exiting.")
+		glog.Fatalf("Failed to create a ClientConfig: %v. Exiting.", err)
+	}
+
+	clientset, err := clientset.NewForConfig(clientConfig)
+	if err != nil {
+		glog.Fatalf("Failed to create a ClientSet: %v. Exiting.", err)
+	}
+	internalClientset, err := internalclientset.NewForConfig(clientConfig)
+	if err != nil {
+		glog.Fatalf("Failed to create an internal ClientSet: %v. Exiting.", err)
 	}
 
 	if config.Morph == "kubelet" {
-		cadvisorInterface := new(cadvisortest.Fake)
+		cadvisorInterface := &cadvisortest.Fake{
+			NodeName: config.NodeName,
+		}
 		containerManager := cm.NewStubContainerManager()
-
-		fakeDockerClient := dockertools.NewFakeDockerClient()
-		fakeDockerClient.VersionInfo = docker.Env{"Version=1.1.3", "ApiVersion=1.18"}
+		fakeDockerClient := libdocker.NewFakeDockerClient().WithTraceDisabled()
 		fakeDockerClient.EnableSleep = true
 
 		hollowKubelet := kubemark.NewHollowKubelet(
@@ -115,23 +128,36 @@ func main() {
 			config.KubeletReadOnlyPort,
 			containerManager,
 			maxPods,
+			podsPerCore,
 		)
 		hollowKubelet.Run()
 	}
 
 	if config.Morph == "proxy" {
-		eventBroadcaster := record.NewBroadcaster()
-		recorder := eventBroadcaster.NewRecorder(api.EventSource{Component: "kube-proxy", Host: config.NodeName})
-
+		client, err := clientgoclientset.NewForConfig(clientConfig)
+		if err != nil {
+			glog.Fatalf("Failed to create API Server client: %v", err)
+		}
 		iptInterface := fakeiptables.NewFake()
+		sysctl := fakesysctl.NewFake()
+		execer := &fakeexec.FakeExec{}
+		eventBroadcaster := record.NewBroadcaster()
+		recorder := eventBroadcaster.NewRecorder(legacyscheme.Scheme, v1.EventSource{Component: "kube-proxy", Host: config.NodeName})
 
-		serviceConfig := proxyconfig.NewServiceConfig()
-		serviceConfig.RegisterHandler(&kubemark.FakeProxyHandler{})
-
-		endpointsConfig := proxyconfig.NewEndpointsConfig()
-		endpointsConfig.RegisterHandler(&kubemark.FakeProxyHandler{})
-
-		hollowProxy := kubemark.NewHollowProxyOrDie(config.NodeName, cl, endpointsConfig, serviceConfig, iptInterface, eventBroadcaster, recorder)
+		hollowProxy, err := kubemark.NewHollowProxyOrDie(
+			config.NodeName,
+			internalClientset,
+			client.CoreV1(),
+			iptInterface,
+			sysctl,
+			execer,
+			eventBroadcaster,
+			recorder,
+			config.UseRealProxier,
+		)
+		if err != nil {
+			glog.Fatalf("Failed to create hollowProxy instance: %v", err)
+		}
 		hollowProxy.Run()
 	}
 }

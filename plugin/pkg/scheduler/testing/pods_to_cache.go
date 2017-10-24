@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,35 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package schedulercache
+package testing
 
 import (
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 )
 
 // PodsToCache is used for testing
-type PodsToCache []*api.Pod
+type PodsToCache []*v1.Pod
 
-func (p PodsToCache) AssumePodIfBindSucceed(pod *api.Pod, bind func() bool) error {
-	if !bind() {
-		return nil
-	}
+func (p PodsToCache) AssumePod(pod *v1.Pod) error { return nil }
+
+func (p PodsToCache) ForgetPod(pod *v1.Pod) error { return nil }
+
+func (p PodsToCache) AddPod(pod *v1.Pod) error { return nil }
+
+func (p PodsToCache) UpdatePod(oldPod, newPod *v1.Pod) error { return nil }
+
+func (p PodsToCache) RemovePod(pod *v1.Pod) error { return nil }
+
+func (p PodsToCache) AddNode(node *v1.Node) error { return nil }
+
+func (p PodsToCache) UpdateNode(oldNode, newNode *v1.Node) error { return nil }
+
+func (p PodsToCache) RemoveNode(node *v1.Node) error { return nil }
+
+func (p PodsToCache) UpdateNodeNameToInfoMap(infoMap map[string]*schedulercache.NodeInfo) error {
 	return nil
 }
 
-func (p PodsToCache) AddPod(pod *api.Pod) error { return nil }
-
-func (p PodsToCache) UpdatePod(oldPod, newPod *api.Pod) error { return nil }
-
-func (p PodsToCache) RemovePod(pod *api.Pod) error { return nil }
-
-func (p PodsToCache) GetNodeNameToInfoMap() (map[string]*schedulercache.NodeInfo, error) {
-	return schedulercache.CreateNodeNameToInfoMap(p), nil
-}
-
-func (p PodsToCache) List(s labels.Selector) (selected []*api.Pod, err error) {
+func (p PodsToCache) List(s labels.Selector) (selected []*v1.Pod, err error) {
 	for _, pod := range p {
 		if s.Matches(labels.Set(pod.Labels)) {
 			selected = append(selected, pod)

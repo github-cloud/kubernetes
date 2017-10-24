@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	"github.com/golang/glog"
 	"golang.org/x/crypto/ssh"
@@ -327,4 +327,30 @@ func TestSSHUser(t *testing.T) {
 
 	}
 
+}
+
+func TestTimeoutDialer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		t.FailNow()
+	}
+
+	testCases := []struct {
+		timeout           time.Duration
+		expectedErrString string
+	}{
+		// delay > timeout should cause ssh.Dial to timeout.
+		{1, "i/o timeout"},
+	}
+	for _, tc := range testCases {
+		dialer := &timeoutDialer{&realSSHDialer{}, tc.timeout}
+		_, err := dialer.Dial("tcp", listener.Addr().String(), &ssh.ClientConfig{})
+		if len(tc.expectedErrString) == 0 && err != nil ||
+			!strings.Contains(fmt.Sprint(err), tc.expectedErrString) {
+			t.Errorf("Expected error to contain %q; got %v", tc.expectedErrString, err)
+		}
+	}
+
+	listener.Close()
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,34 +16,117 @@ limitations under the License.
 
 package v1alpha1
 
-import "k8s.io/kubernetes/pkg/api/unversioned"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
+// ClientConnectionConfiguration contains details for constructing a client.
+type ClientConnectionConfiguration struct {
+	// kubeConfigFile is the path to a kubeconfig file.
+	KubeConfigFile string `json:"kubeconfig"`
+	// acceptContentTypes defines the Accept header sent by clients when connecting to a server, overriding the
+	// default value of 'application/json'. This field will control all connections to the server used by a particular
+	// client.
+	AcceptContentTypes string `json:"acceptContentTypes"`
+	// contentType is the content type used when sending data to the server from this client.
+	ContentType string `json:"contentType"`
+	// cps controls the number of queries per second allowed for this connection.
+	QPS float32 `json:"qps"`
+	// burst allows extra queries to accumulate when a client is exceeding its rate.
+	Burst int `json:"burst"`
+}
+
+// KubeProxyIPTablesConfiguration contains iptables-related configuration
+// details for the Kubernetes proxy server.
+type KubeProxyIPTablesConfiguration struct {
+	// masqueradeBit is the bit of the iptables fwmark space to use for SNAT if using
+	// the pure iptables proxy mode. Values must be within the range [0, 31].
+	MasqueradeBit *int32 `json:"masqueradeBit"`
+	// masqueradeAll tells kube-proxy to SNAT everything if using the pure iptables proxy mode.
+	MasqueradeAll bool `json:"masqueradeAll"`
+	// syncPeriod is the period that iptables rules are refreshed (e.g. '5s', '1m',
+	// '2h22m').  Must be greater than 0.
+	SyncPeriod metav1.Duration `json:"syncPeriod"`
+	// minSyncPeriod is the minimum period that iptables rules are refreshed (e.g. '5s', '1m',
+	// '2h22m').
+	MinSyncPeriod metav1.Duration `json:"minSyncPeriod"`
+}
+
+// KubeProxyIPVSConfiguration contains ipvs-related configuration
+// details for the Kubernetes proxy server.
+type KubeProxyIPVSConfiguration struct {
+	// syncPeriod is the period that ipvs rules are refreshed (e.g. '5s', '1m',
+	// '2h22m').  Must be greater than 0.
+	SyncPeriod metav1.Duration `json:"syncPeriod"`
+	// minSyncPeriod is the minimum period that ipvs rules are refreshed (e.g. '5s', '1m',
+	// '2h22m').
+	MinSyncPeriod metav1.Duration `json:"minSyncPeriod"`
+	// ipvs scheduler
+	Scheduler string `json:"scheduler"`
+}
+
+// KubeProxyConntrackConfiguration contains conntrack settings for
+// the Kubernetes proxy server.
+type KubeProxyConntrackConfiguration struct {
+	// max is the maximum number of NAT connections to track (0 to
+	// leave as-is).  This takes precedence over conntrackMaxPerCore and conntrackMin.
+	Max int32 `json:"max"`
+	// maxPerCore is the maximum number of NAT connections to track
+	// per CPU core (0 to leave the limit as-is and ignore conntrackMin).
+	MaxPerCore int32 `json:"maxPerCore"`
+	// min is the minimum value of connect-tracking records to allocate,
+	// regardless of conntrackMaxPerCore (set conntrackMaxPerCore=0 to leave the limit as-is).
+	Min int32 `json:"min"`
+	// tcpEstablishedTimeout is how long an idle TCP connection will be kept open
+	// (e.g. '2s').  Must be greater than 0.
+	TCPEstablishedTimeout metav1.Duration `json:"tcpEstablishedTimeout"`
+	// tcpCloseWaitTimeout is how long an idle conntrack entry
+	// in CLOSE_WAIT state will remain in the conntrack
+	// table. (e.g. '60s'). Must be greater than 0 to set.
+	TCPCloseWaitTimeout metav1.Duration `json:"tcpCloseWaitTimeout"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// KubeProxyConfiguration contains everything necessary to configure the
+// Kubernetes proxy server.
 type KubeProxyConfiguration struct {
-	unversioned.TypeMeta
+	metav1.TypeMeta `json:",inline"`
+
+	// featureGates is a comma-separated list of key=value pairs that control
+	// which alpha/beta features are enabled.
+	//
+	// TODO this really should be a map but that requires refactoring all
+	// components to use config files because local-up-cluster.sh only supports
+	// the --feature-gates flag right now, which is comma-separated key=value
+	// pairs.
+	FeatureGates string `json:"featureGates"`
 
 	// bindAddress is the IP address for the proxy server to serve on (set to 0.0.0.0
 	// for all interfaces)
 	BindAddress string `json:"bindAddress"`
-	// healthzBindAddress is the IP address for the health check server to serve on,
-	// defaulting to 127.0.0.1 (set to 0.0.0.0 for all interfaces)
+	// healthzBindAddress is the IP address and port for the health check server to serve on,
+	// defaulting to 0.0.0.0:10256
 	HealthzBindAddress string `json:"healthzBindAddress"`
-	// healthzPort is the port to bind the health check server. Use 0 to disable.
-	HealthzPort int32 `json:"healthzPort"`
+	// metricsBindAddress is the IP address and port for the metrics server to serve on,
+	// defaulting to 127.0.0.1:10249 (set to 0.0.0.0 for all interfaces)
+	MetricsBindAddress string `json:"metricsBindAddress"`
+	// enableProfiling enables profiling via web interface on /debug/pprof handler.
+	// Profiling handlers will be handled by metrics server.
+	EnableProfiling bool `json:"enableProfiling"`
+	// clusterCIDR is the CIDR range of the pods in the cluster. It is used to
+	// bridge traffic coming from outside of the cluster. If not provided,
+	// no off-cluster bridging will be performed.
+	ClusterCIDR string `json:"clusterCIDR"`
 	// hostnameOverride, if non-empty, will be used as the identity instead of the actual hostname.
 	HostnameOverride string `json:"hostnameOverride"`
-	// iptablesMasqueradeBit is the bit of the iptables fwmark space to use for SNAT if using
-	// the pure iptables proxy mode. Values must be within the range [0, 31].
-	IPTablesMasqueradeBit *int32 `json:"iptablesMasqueradeBit"`
-	// iptablesSyncPeriod is the period that iptables rules are refreshed (e.g. '5s', '1m',
-	// '2h22m').  Must be greater than 0.
-	IPTablesSyncPeriod unversioned.Duration `json:"iptablesSyncPeriodSeconds"`
-	// kubeconfigPath is the path to the kubeconfig file with authorization information (the
-	// master location is set by the master flag).
-	KubeconfigPath string `json:"kubeconfigPath"`
-	// masqueradeAll tells kube-proxy to SNAT everything if using the pure iptables proxy mode.
-	MasqueradeAll bool `json:"masqueradeAll"`
-	// master is the address of the Kubernetes API server (overrides any value in kubeconfig)
-	Master string `json:"master"`
+	// clientConnection specifies the kubeconfig file and client connection settings for the proxy
+	// server to use when communicating with the apiserver.
+	ClientConnection ClientConnectionConfiguration `json:"clientConnection"`
+	// iptables contains iptables-related configuration options.
+	IPTables KubeProxyIPTablesConfiguration `json:"iptables"`
+	// ipvs contains ipvs-related configuration options.
+	IPVS KubeProxyIPVSConfiguration `json:"ipvs"`
 	// oomScoreAdj is the oom-score-adj value for kube-proxy process. Values must be within
 	// the range [-1000, 1000]
 	OOMScoreAdj *int32 `json:"oomScoreAdj"`
@@ -57,20 +140,19 @@ type KubeProxyConfiguration struct {
 	ResourceContainer string `json:"resourceContainer"`
 	// udpIdleTimeout is how long an idle UDP connection will be kept open (e.g. '250ms', '2s').
 	// Must be greater than 0. Only applicable for proxyMode=userspace.
-	UDPIdleTimeout unversioned.Duration `json:"udpTimeoutMilliseconds"`
-	// conntrackMax is the maximum number of NAT connections to track (0 to leave as-is)")
-	ConntrackMax int32 `json:"conntrackMax"`
-	// conntrackTCPEstablishedTimeout is how long an idle UDP connection will be kept open
-	// (e.g. '250ms', '2s').  Must be greater than 0. Only applicable for proxyMode is Userspace
-	ConntrackTCPEstablishedTimeout unversioned.Duration `json:"conntrackTCPEstablishedTimeout"`
+	UDPIdleTimeout metav1.Duration `json:"udpTimeoutMilliseconds"`
+	// conntrack contains conntrack-related configuration options.
+	Conntrack KubeProxyConntrackConfiguration `json:"conntrack"`
+	// configSyncPeriod is how often configuration from the apiserver is refreshed. Must be greater
+	// than 0.
+	ConfigSyncPeriod metav1.Duration `json:"configSyncPeriod"`
 }
 
 // Currently two modes of proxying are available: 'userspace' (older, stable) or 'iptables'
-// (experimental). If blank, look at the Node object on the Kubernetes API and respect the
-// 'net.experimental.kubernetes.io/proxy-mode' annotation if provided.  Otherwise use the
-// best-available proxy (currently userspace, but may change in future versions).  If the
-// iptables proxy is selected, regardless of how, but the system's kernel or iptables
-// versions are insufficient, this always falls back to the userspace proxy.
+// (newer, faster). If blank, use the best-available proxy (currently iptables, but may
+// change in future versions).  If the iptables proxy is selected, regardless of how, but
+// the system's kernel or iptables versions are insufficient, this always falls back to the
+// userspace proxy.
 type ProxyMode string
 
 const (
@@ -78,8 +160,10 @@ const (
 	ProxyModeIPTables  ProxyMode = "iptables"
 )
 
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
 type KubeSchedulerConfiguration struct {
-	unversioned.TypeMeta
+	metav1.TypeMeta `json:",inline"`
 
 	// port is the port that the scheduler's http service runs on.
 	Port int `json:"port"`
@@ -91,17 +175,61 @@ type KubeSchedulerConfiguration struct {
 	PolicyConfigFile string `json:"policyConfigFile"`
 	// enableProfiling enables profiling via web interface.
 	EnableProfiling *bool `json:"enableProfiling"`
+	// enableContentionProfiling enables lock contention profiling, if enableProfiling is true.
+	EnableContentionProfiling bool `json:"enableContentionProfiling"`
+	// contentType is contentType of requests sent to apiserver.
+	ContentType string `json:"contentType"`
 	// kubeAPIQPS is the QPS to use while talking with kubernetes apiserver.
 	KubeAPIQPS float32 `json:"kubeAPIQPS"`
 	// kubeAPIBurst is the QPS burst to use while talking with kubernetes apiserver.
 	KubeAPIBurst int `json:"kubeAPIBurst"`
 	// schedulerName is name of the scheduler, used to select which pods
-	// will be processed by this scheduler, based on pod's annotation with
-	// key 'scheduler.alpha.kubernetes.io/name'.
+	// will be processed by this scheduler, based on pod's "spec.SchedulerName".
 	SchedulerName string `json:"schedulerName"`
+	// RequiredDuringScheduling affinity is not symmetric, but there is an implicit PreferredDuringScheduling affinity rule
+	// corresponding to every RequiredDuringScheduling affinity rule.
+	// HardPodAffinitySymmetricWeight represents the weight of implicit PreferredDuringScheduling affinity rule, in the range 0-100.
+	HardPodAffinitySymmetricWeight int `json:"hardPodAffinitySymmetricWeight"`
+	// Indicate the "all topologies" set for empty topologyKey when it's used for PreferredDuringScheduling pod anti-affinity.
+	FailureDomains string `json:"failureDomains"`
 	// leaderElection defines the configuration of leader election client.
 	LeaderElection LeaderElectionConfiguration `json:"leaderElection"`
+	// LockObjectNamespace defines the namespace of the lock object
+	LockObjectNamespace string `json:"lockObjectNamespace"`
+	// LockObjectName defines the lock object name
+	LockObjectName string `json:"lockObjectName"`
+	// PolicyConfigMapName is the name of the ConfigMap object that specifies
+	// the scheduler's policy config. If UseLegacyPolicyConfig is true, scheduler
+	// uses PolicyConfigFile. If UseLegacyPolicyConfig is false and
+	// PolicyConfigMapName is not empty, the ConfigMap object with this name must
+	// exist in PolicyConfigMapNamespace before scheduler initialization.
+	PolicyConfigMapName string `json:"policyConfigMapName"`
+	// PolicyConfigMapNamespace is the namespace where the above policy config map
+	// is located. If none is provided default system namespace ("kube-system")
+	// will be used.
+	PolicyConfigMapNamespace string `json:"policyConfigMapNamespace"`
+	// UseLegacyPolicyConfig tells the scheduler to ignore Policy ConfigMap and
+	// to use PolicyConfigFile if available.
+	UseLegacyPolicyConfig bool `json:"useLegacyPolicyConfig"`
 }
+
+// HairpinMode denotes how the kubelet should configure networking to handle
+// hairpin packets.
+type HairpinMode string
+
+// Enum settings for different ways to handle hairpin packets.
+const (
+	// Set the hairpin flag on the veth of containers in the respective
+	// container runtime.
+	HairpinVeth = "hairpin-veth"
+	// Make the container bridge promiscuous. This will force it to accept
+	// hairpin packets, even if the flag isn't set on ports of the bridge.
+	PromiscuousBridge = "promiscuous-bridge"
+	// Neither of the above. If the kubelet is started in this hairpin mode
+	// and kube-proxy is running in iptables mode, hairpin packets will be
+	// dropped by the container bridge.
+	HairpinNone = "none"
+)
 
 // LeaderElectionConfiguration defines the configuration of leader election
 // clients for components that can run with leader election enabled.
@@ -116,14 +244,25 @@ type LeaderElectionConfiguration struct {
 	// maximum duration that a leader can be stopped before it is replaced
 	// by another candidate. This is only applicable if leader election is
 	// enabled.
-	LeaseDuration unversioned.Duration `json:"leaseDuration"`
+	LeaseDuration metav1.Duration `json:"leaseDuration"`
 	// renewDeadline is the interval between attempts by the acting master to
 	// renew a leadership slot before it stops leading. This must be less
 	// than or equal to the lease duration. This is only applicable if leader
 	// election is enabled.
-	RenewDeadline unversioned.Duration `json:"renewDeadline"`
+	RenewDeadline metav1.Duration `json:"renewDeadline"`
 	// retryPeriod is the duration the clients should wait between attempting
 	// acquisition and renewal of a leadership. This is only applicable if
 	// leader election is enabled.
-	RetryPeriod unversioned.Duration `json:"retryPeriod"`
+	RetryPeriod metav1.Duration `json:"retryPeriod"`
+	// resourceLock indicates the resource object type that will be used to lock
+	// during leader election cycles.
+	ResourceLock string `json:"resourceLock"`
 }
+
+const (
+	// "kube-system" is the default scheduler lock object namespace
+	SchedulerDefaultLockObjectNamespace string = "kube-system"
+
+	// "kube-scheduler" is the default scheduler lock object name
+	SchedulerDefaultLockObjectName = "kube-scheduler"
+)

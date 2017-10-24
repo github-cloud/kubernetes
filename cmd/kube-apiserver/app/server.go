@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,46 +22,80 @@ package app
 import (
 	"crypto/tls"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/go-openapi/spec"
 	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	utilwait "k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/filters"
+	serveroptions "k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
+	serverstorage "k8s.io/apiserver/pkg/server/storage"
+	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
+	openapi "k8s.io/kube-openapi/pkg/common"
+
+	"k8s.io/apiserver/pkg/storage/etcd3/preflight"
+	clientgoinformers "k8s.io/client-go/informers"
+	clientgoclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
-	"k8s.io/kubernetes/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/apimachinery/registered"
-	"k8s.io/kubernetes/pkg/apis/autoscaling"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
-	"k8s.io/kubernetes/pkg/apiserver"
-	"k8s.io/kubernetes/pkg/apiserver/authenticator"
+	"k8s.io/kubernetes/pkg/apis/networking"
 	"k8s.io/kubernetes/pkg/capabilities"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/restclient"
+	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
+	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
-	"k8s.io/kubernetes/pkg/genericapiserver"
-	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
+	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
+	"k8s.io/kubernetes/pkg/kubeapiserver"
+	kubeapiserveradmission "k8s.io/kubernetes/pkg/kubeapiserver/admission"
+	kubeauthenticator "k8s.io/kubernetes/pkg/kubeapiserver/authenticator"
+	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
+	kubeoptions "k8s.io/kubernetes/pkg/kubeapiserver/options"
+	kubeserver "k8s.io/kubernetes/pkg/kubeapiserver/server"
 	"k8s.io/kubernetes/pkg/master"
+	"k8s.io/kubernetes/pkg/master/reconcilers"
+	"k8s.io/kubernetes/pkg/master/tunneler"
+	quotainstall "k8s.io/kubernetes/pkg/quota/install"
 	"k8s.io/kubernetes/pkg/registry/cachesize"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/runtime/serializer/versioning"
-	"k8s.io/kubernetes/pkg/serviceaccount"
-	"k8s.io/kubernetes/pkg/storage"
-	etcdstorage "k8s.io/kubernetes/pkg/storage/etcd"
-	utilnet "k8s.io/kubernetes/pkg/util/net"
+	rbacrest "k8s.io/kubernetes/pkg/registry/rbac/rest"
+	"k8s.io/kubernetes/pkg/version"
+	"k8s.io/kubernetes/plugin/pkg/auth/authenticator/token/bootstrap"
+
+	"k8s.io/client-go/rest"
+	"k8s.io/kubernetes/pkg/api"
+	_ "k8s.io/kubernetes/pkg/util/reflector/prometheus" // for reflector metric registration
+	_ "k8s.io/kubernetes/pkg/util/workqueue/prometheus" // for workqueue metric registration
 )
+
+const etcdRetryLimit = 60
+const etcdRetryInterval = 1 * time.Second
 
 // NewAPIServerCommand creates a *cobra.Command object with default parameters
 func NewAPIServerCommand() *cobra.Command {
-	s := options.NewAPIServer()
+	s := options.NewServerRunOptions()
 	s.AddFlags(pflag.CommandLine)
 	cmd := &cobra.Command{
 		Use: "kube-apiserver",
@@ -76,123 +110,176 @@ cluster's shared state through which all other components interact.`,
 	return cmd
 }
 
-// TODO: Longer term we should read this from some config store, rather than a flag.
-func verifyClusterIPFlags(s *options.APIServer) {
-	if s.ServiceClusterIPRange.IP == nil {
-		glog.Fatal("No --service-cluster-ip-range specified")
-	}
-	var ones, bits = s.ServiceClusterIPRange.Mask.Size()
-	if bits-ones > 20 {
-		glog.Fatal("Specified --service-cluster-ip-range is too large")
-	}
-}
-
-// For testing.
-type newEtcdFunc func(runtime.NegotiatedSerializer, string, string, etcdstorage.EtcdConfig) (storage.Interface, error)
-
-func newEtcd(ns runtime.NegotiatedSerializer, storageGroupVersionString, memoryGroupVersionString string, etcdConfig etcdstorage.EtcdConfig) (etcdStorage storage.Interface, err error) {
-	if storageGroupVersionString == "" {
-		return etcdStorage, fmt.Errorf("storageVersion is required to create a etcd storage")
-	}
-	storageVersion, err := unversioned.ParseGroupVersion(storageGroupVersionString)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't understand storage version %v: %v", storageGroupVersionString, err)
-	}
-	memoryVersion, err := unversioned.ParseGroupVersion(memoryGroupVersionString)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't understand memory version %v: %v", memoryGroupVersionString, err)
-	}
-
-	var storageConfig etcdstorage.EtcdStorageConfig
-	storageConfig.Config = etcdConfig
-	s, ok := ns.SerializerForMediaType("application/json", nil)
-	if !ok {
-		return nil, fmt.Errorf("unable to find serializer for JSON")
-	}
-	glog.Infof("constructing etcd storage interface.\n  sv: %v\n  mv: %v\n", storageVersion, memoryVersion)
-	encoder := ns.EncoderForVersion(s, storageVersion)
-	decoder := ns.DecoderToVersion(s, memoryVersion)
-	if memoryVersion.Group != storageVersion.Group {
-		// Allow this codec to translate between groups.
-		if err = versioning.EnableCrossGroupEncoding(encoder, memoryVersion.Group, storageVersion.Group); err != nil {
-			return nil, fmt.Errorf("error setting up encoder for %v: %v", storageGroupVersionString, err)
-		}
-		if err = versioning.EnableCrossGroupDecoding(decoder, storageVersion.Group, memoryVersion.Group); err != nil {
-			return nil, fmt.Errorf("error setting up decoder for %v: %v", storageGroupVersionString, err)
-		}
-	}
-	storageConfig.Codec = runtime.NewCodec(encoder, decoder)
-	return storageConfig.NewStorage()
-}
-
-// parse the value of --etcd-servers-overrides and update given storageDestinations.
-func updateEtcdOverrides(overrides []string, storageVersions map[string]string, etcdConfig etcdstorage.EtcdConfig, storageDestinations *genericapiserver.StorageDestinations, newEtcdFn newEtcdFunc) {
-	if len(overrides) == 0 {
-		return
-	}
-	for _, override := range overrides {
-		tokens := strings.Split(override, "#")
-		if len(tokens) != 2 {
-			glog.Errorf("invalid value of etcd server overrides: %s", override)
-			continue
-		}
-
-		apiresource := strings.Split(tokens[0], "/")
-		if len(apiresource) != 2 {
-			glog.Errorf("invalid resource definition: %s", tokens[0])
-		}
-		group := apiresource[0]
-		resource := apiresource[1]
-
-		apigroup, err := registered.Group(group)
-		if err != nil {
-			glog.Errorf("invalid api group %s: %v", group, err)
-			continue
-		}
-		if _, found := storageVersions[apigroup.GroupVersion.Group]; !found {
-			glog.Errorf("Couldn't find the storage version for group %s", apigroup.GroupVersion.Group)
-			continue
-		}
-
-		servers := strings.Split(tokens[1], ";")
-		overrideEtcdConfig := etcdConfig
-		overrideEtcdConfig.ServerList = servers
-		// Note, internalGV will be wrong for things like batch or
-		// autoscalers, but they shouldn't be using the override
-		// storage.
-		internalGV := apigroup.GroupVersion.Group + "/__internal"
-		etcdOverrideStorage, err := newEtcdFn(api.Codecs, storageVersions[apigroup.GroupVersion.Group], internalGV, overrideEtcdConfig)
-		if err != nil {
-			glog.Fatalf("Invalid storage version or misconfigured etcd for %s: %v", tokens[0], err)
-		}
-
-		storageDestinations.AddStorageOverride(group, resource, etcdOverrideStorage)
-	}
-}
-
 // Run runs the specified APIServer.  This should never exit.
-func Run(s *options.APIServer) error {
-	verifyClusterIPFlags(s)
+func Run(runOptions *options.ServerRunOptions, stopCh <-chan struct{}) error {
+	// To help debugging, immediately log version
+	glog.Infof("Version: %+v", version.Get())
 
-	// If advertise-address is not specified, use bind-address. If bind-address
-	// is not usable (unset, 0.0.0.0, or loopback), we will use the host's default
-	// interface as valid public addr for master (see: util/net#ValidPublicAddrForMaster)
-	if s.AdvertiseAddress == nil || s.AdvertiseAddress.IsUnspecified() {
-		hostIP, err := utilnet.ChooseBindAddress(s.BindAddress)
-		if err != nil {
-			glog.Fatalf("Unable to find suitable network address.error='%v' . "+
-				"Try to set the AdvertiseAddress directly or provide a valid BindAddress to fix this.", err)
+	server, err := CreateServerChain(runOptions, stopCh)
+	if err != nil {
+		return err
+	}
+
+	return server.PrepareRun().Run(stopCh)
+}
+
+// CreateServerChain creates the apiservers connected via delegation.
+func CreateServerChain(runOptions *options.ServerRunOptions, stopCh <-chan struct{}) (*genericapiserver.GenericAPIServer, error) {
+	nodeTunneler, proxyTransport, err := CreateNodeDialer(runOptions)
+	if err != nil {
+		return nil, err
+	}
+	kubeAPIServerConfig, sharedInformers, versionedInformers, insecureServingOptions, serviceResolver, err := CreateKubeAPIServerConfig(runOptions, nodeTunneler, proxyTransport)
+	if err != nil {
+		return nil, err
+	}
+
+	// TPRs are enabled and not yet beta, since this these are the successor, they fall under the same enablement rule
+	// If additional API servers are added, they should be gated.
+	apiExtensionsConfig, err := createAPIExtensionsConfig(*kubeAPIServerConfig.GenericConfig, versionedInformers, runOptions)
+	if err != nil {
+		return nil, err
+	}
+	apiExtensionsServer, err := createAPIExtensionsServer(apiExtensionsConfig, genericapiserver.EmptyDelegate)
+	if err != nil {
+		return nil, err
+	}
+
+	kubeAPIServer, err := CreateKubeAPIServer(kubeAPIServerConfig, apiExtensionsServer.GenericAPIServer, sharedInformers, versionedInformers)
+	if err != nil {
+		return nil, err
+	}
+
+	// if we're starting up a hacked up version of this API server for a weird test case,
+	// just start the API server as is because clients don't get built correctly when you do this
+	if len(os.Getenv("KUBE_API_VERSIONS")) > 0 {
+		if insecureServingOptions != nil {
+			insecureHandlerChain := kubeserver.BuildInsecureHandlerChain(kubeAPIServer.GenericAPIServer.UnprotectedHandler(), kubeAPIServerConfig.GenericConfig)
+			if err := kubeserver.NonBlockingRun(insecureServingOptions, insecureHandlerChain, stopCh); err != nil {
+				return nil, err
+			}
 		}
-		s.AdvertiseAddress = hostIP
-	}
-	glog.Infof("Will report %v as public IP address.", s.AdvertiseAddress)
 
-	if len(s.EtcdConfig.ServerList) == 0 {
-		glog.Fatalf("--etcd-servers must be specified")
+		return kubeAPIServer.GenericAPIServer, nil
 	}
 
-	if s.KubernetesServiceNodePort > 0 && !s.ServiceNodePortRange.Contains(s.KubernetesServiceNodePort) {
-		glog.Fatalf("Kubernetes service port range %v doesn't contain %v", s.ServiceNodePortRange, (s.KubernetesServiceNodePort))
+	// otherwise go down the normal path of standing the aggregator up in front of the API server
+	// this wires up openapi
+	kubeAPIServer.GenericAPIServer.PrepareRun()
+
+	// This will wire up openapi for extension api server
+	apiExtensionsServer.GenericAPIServer.PrepareRun()
+
+	// aggregator comes last in the chain
+	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, runOptions, versionedInformers, serviceResolver, proxyTransport)
+	if err != nil {
+		return nil, err
+	}
+	aggregatorConfig.ExtraConfig.ProxyTransport = proxyTransport
+	aggregatorConfig.ExtraConfig.ServiceResolver = serviceResolver
+	aggregatorServer, err := createAggregatorServer(aggregatorConfig, kubeAPIServer.GenericAPIServer, apiExtensionsServer.Informers)
+	if err != nil {
+		// we don't need special handling for innerStopCh because the aggregator server doesn't create any go routines
+		return nil, err
+	}
+
+	if insecureServingOptions != nil {
+		insecureHandlerChain := kubeserver.BuildInsecureHandlerChain(aggregatorServer.GenericAPIServer.UnprotectedHandler(), kubeAPIServerConfig.GenericConfig)
+		if err := kubeserver.NonBlockingRun(insecureServingOptions, insecureHandlerChain, stopCh); err != nil {
+			return nil, err
+		}
+	}
+
+	return aggregatorServer.GenericAPIServer, nil
+}
+
+// CreateKubeAPIServer creates and wires a workable kube-apiserver
+func CreateKubeAPIServer(kubeAPIServerConfig *master.Config, delegateAPIServer genericapiserver.DelegationTarget, sharedInformers informers.SharedInformerFactory, versionedInformers clientgoinformers.SharedInformerFactory) (*master.Master, error) {
+	kubeAPIServer, err := kubeAPIServerConfig.Complete(versionedInformers).New(delegateAPIServer)
+	if err != nil {
+		return nil, err
+	}
+	kubeAPIServer.GenericAPIServer.AddPostStartHook("start-kube-apiserver-informers", func(context genericapiserver.PostStartHookContext) error {
+		sharedInformers.Start(context.StopCh)
+		return nil
+	})
+
+	return kubeAPIServer, nil
+}
+
+// CreateNodeDialer creates the dialer infrastructure to connect to the nodes.
+func CreateNodeDialer(s *options.ServerRunOptions) (tunneler.Tunneler, *http.Transport, error) {
+	// Setup nodeTunneler if needed
+	var nodeTunneler tunneler.Tunneler
+	var proxyDialerFn utilnet.DialFunc
+	if len(s.SSHUser) > 0 {
+		// Get ssh key distribution func, if supported
+		var installSSHKey tunneler.InstallSSHKey
+		cloud, err := cloudprovider.InitCloudProvider(s.CloudProvider.CloudProvider, s.CloudProvider.CloudConfigFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cloud provider could not be initialized: %v", err)
+		}
+		if cloud != nil {
+			if instances, supported := cloud.Instances(); supported {
+				installSSHKey = instances.AddSSHKeyToAllInstances
+			}
+		}
+		if s.KubeletConfig.Port == 0 {
+			return nil, nil, fmt.Errorf("must enable kubelet port if proxy ssh-tunneling is specified")
+		}
+		if s.KubeletConfig.ReadOnlyPort == 0 {
+			return nil, nil, fmt.Errorf("must enable kubelet readonly port if proxy ssh-tunneling is specified")
+		}
+		// Set up the nodeTunneler
+		// TODO(cjcullen): If we want this to handle per-kubelet ports or other
+		// kubelet listen-addresses, we need to plumb through options.
+		healthCheckPath := &url.URL{
+			Scheme: "http",
+			Host:   net.JoinHostPort("127.0.0.1", strconv.FormatUint(uint64(s.KubeletConfig.ReadOnlyPort), 10)),
+			Path:   "healthz",
+		}
+		nodeTunneler = tunneler.New(s.SSHUser, s.SSHKeyfile, healthCheckPath, installSSHKey)
+
+		// Use the nodeTunneler's dialer when proxying to pods, services, and nodes
+		proxyDialerFn = nodeTunneler.Dial
+	}
+	// Proxying to pods and services is IP-based... don't expect to be able to verify the hostname
+	proxyTLSClientConfig := &tls.Config{InsecureSkipVerify: true}
+	proxyTransport := utilnet.SetTransportDefaults(&http.Transport{
+		Dial:            proxyDialerFn,
+		TLSClientConfig: proxyTLSClientConfig,
+	})
+	return nodeTunneler, proxyTransport, nil
+}
+
+// CreateKubeAPIServerConfig creates all the resources for running the API server, but runs none of them
+func CreateKubeAPIServerConfig(s *options.ServerRunOptions, nodeTunneler tunneler.Tunneler, proxyTransport *http.Transport) (*master.Config, informers.SharedInformerFactory, clientgoinformers.SharedInformerFactory, *kubeserver.InsecureServingInfo, aggregatorapiserver.ServiceResolver, error) {
+	// set defaults in the options before trying to create the generic config
+	if err := defaultOptions(s); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	// validate options
+	if errs := s.Validate(); len(errs) != 0 {
+		return nil, nil, nil, nil, nil, utilerrors.NewAggregate(errs)
+	}
+
+	if s.CloudProvider != nil {
+		// Initialize the cloudprovider once, to give it a chance to register KMS plugins, if any.
+		_, err := cloudprovider.InitCloudProvider(s.CloudProvider.CloudProvider, s.CloudProvider.CloudConfigFile)
+		if err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
+	}
+	genericConfig, sharedInformers, versionedInformers, insecureServingOptions, serviceResolver, err := BuildGenericConfig(s, proxyTransport)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	if _, port, err := net.SplitHostPort(s.Etcd.StorageConfig.ServerList[0]); err == nil && port != "0" && len(port) != 0 {
+		if err := utilwait.PollImmediate(etcdRetryInterval, etcdRetryLimit*etcdRetryInterval, preflight.EtcdConnection{ServerList: s.Etcd.StorageConfig.ServerList}.CheckEtcdServers); err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("error waiting for etcd connection: %v", err)
+		}
 	}
 
 	capabilities.Initialize(capabilities.Capabilities{
@@ -206,381 +293,749 @@ func Run(s *options.APIServer) error {
 		PerConnectionBandwidthLimitBytesPerSec: s.MaxConnectionBytesPerSec,
 	})
 
-	cloud, err := cloudprovider.InitCloudProvider(s.CloudProvider, s.CloudConfigFile)
+	serviceIPRange, apiServerServiceIP, err := master.DefaultServiceIPRange(s.ServiceClusterIPRange)
 	if err != nil {
-		glog.Fatalf("Cloud provider could not be initialized: %v", err)
+		return nil, nil, nil, nil, nil, err
 	}
 
-	// Setup tunneler if needed
-	var tunneler master.Tunneler
-	var proxyDialerFn apiserver.ProxyDialerFunc
-	if len(s.SSHUser) > 0 {
-		// Get ssh key distribution func, if supported
-		var installSSH master.InstallSSHKey
-		if cloud != nil {
-			if instances, supported := cloud.Instances(); supported {
-				installSSH = instances.AddSSHKeyToAllInstances
-			}
-		}
-		if s.KubeletConfig.Port == 0 {
-			glog.Fatalf("Must enable kubelet port if proxy ssh-tunneling is specified.")
-		}
-		// Set up the tunneler
-		// TODO(cjcullen): If we want this to handle per-kubelet ports or other
-		// kubelet listen-addresses, we need to plumb through options.
-		healthCheckPath := &url.URL{
-			Scheme: "https",
-			Host:   net.JoinHostPort("127.0.0.1", strconv.FormatUint(uint64(s.KubeletConfig.Port), 10)),
-			Path:   "healthz",
-		}
-		tunneler = master.NewSSHTunneler(s.SSHUser, s.SSHKeyfile, healthCheckPath, installSSH)
-
-		// Use the tunneler's dialer to connect to the kubelet
-		s.KubeletConfig.Dial = tunneler.Dial
-		// Use the tunneler's dialer when proxying to pods, services, and nodes
-		proxyDialerFn = tunneler.Dial
-	}
-
-	// Proxying to pods and services is IP-based... don't expect to be able to verify the hostname
-	proxyTLSClientConfig := &tls.Config{InsecureSkipVerify: true}
-
-	kubeletClient, err := kubeletclient.NewStaticKubeletClient(&s.KubeletConfig)
+	storageFactory, err := BuildStorageFactory(s)
 	if err != nil {
-		glog.Fatalf("Failure to start kubelet client: %v", err)
+		return nil, nil, nil, nil, nil, err
 	}
 
-	apiGroupVersionOverrides, err := parseRuntimeConfig(s)
+	clientCA, err := readCAorNil(s.Authentication.ClientCert.ClientCA)
 	if err != nil {
-		glog.Fatalf("error in parsing runtime-config: %s", err)
+		return nil, nil, nil, nil, nil, err
 	}
-
-	clientConfig := &restclient.Config{
-		Host: net.JoinHostPort(s.InsecureBindAddress.String(), strconv.Itoa(s.InsecurePort)),
-		// Increase QPS limits. The client is currently passed to all admission plugins,
-		// and those can be throttled in case of higher load on apiserver - see #22340 and #22422
-		// for more details. Once #22422 is fixed, we may want to remove it.
-		QPS:   50,
-		Burst: 100,
-	}
-	if len(s.DeprecatedStorageVersion) != 0 {
-		gv, err := unversioned.ParseGroupVersion(s.DeprecatedStorageVersion)
-		if err != nil {
-			glog.Fatalf("error in parsing group version: %s", err)
-		}
-		clientConfig.GroupVersion = &gv
-	}
-
-	client, err := clientset.NewForConfig(clientConfig)
+	requestHeaderProxyCA, err := readCAorNil(s.Authentication.RequestHeader.ClientCAFile)
 	if err != nil {
-		glog.Errorf("Failed to create clientset: %v", err)
-	}
-
-	legacyV1Group, err := registered.Group(api.GroupName)
-	if err != nil {
-		return err
-	}
-
-	storageDestinations := genericapiserver.NewStorageDestinations()
-
-	storageVersions := s.StorageGroupsToGroupVersions()
-	if _, found := storageVersions[legacyV1Group.GroupVersion.Group]; !found {
-		glog.Fatalf("Couldn't find the storage version for group: %q in storageVersions: %v", legacyV1Group.GroupVersion.Group, storageVersions)
-	}
-	etcdStorage, err := newEtcd(api.Codecs, storageVersions[legacyV1Group.GroupVersion.Group], "/__internal", s.EtcdConfig)
-	if err != nil {
-		glog.Fatalf("Invalid storage version or misconfigured etcd: %v", err)
-	}
-	storageDestinations.AddAPIGroup("", etcdStorage)
-
-	if !apiGroupVersionOverrides["extensions/v1beta1"].Disable {
-		glog.Infof("Configuring extensions/v1beta1 storage destination")
-		expGroup, err := registered.Group(extensions.GroupName)
-		if err != nil {
-			glog.Fatalf("Extensions API is enabled in runtime config, but not enabled in the environment variable KUBE_API_VERSIONS. Error: %v", err)
-		}
-		if _, found := storageVersions[expGroup.GroupVersion.Group]; !found {
-			glog.Fatalf("Couldn't find the storage version for group: %q in storageVersions: %v", expGroup.GroupVersion.Group, storageVersions)
-		}
-		expEtcdStorage, err := newEtcd(api.Codecs, storageVersions[expGroup.GroupVersion.Group], "extensions/__internal", s.EtcdConfig)
-		if err != nil {
-			glog.Fatalf("Invalid extensions storage version or misconfigured etcd: %v", err)
-		}
-		storageDestinations.AddAPIGroup(extensions.GroupName, expEtcdStorage)
-
-		// Since HPA has been moved to the autoscaling group, we need to make
-		// sure autoscaling has a storage destination. If the autoscaling group
-		// itself is on, it will overwrite this decision below.
-		storageDestinations.AddAPIGroup(autoscaling.GroupName, expEtcdStorage)
-
-		// Since Job has been moved to the batch group, we need to make
-		// sure batch has a storage destination. If the batch group
-		// itself is on, it will overwrite this decision below.
-		storageDestinations.AddAPIGroup(batch.GroupName, expEtcdStorage)
-	}
-
-	// autoscaling/v1/horizontalpodautoscalers is a move from extensions/v1beta1/horizontalpodautoscalers.
-	// The storage version needs to be either extensions/v1beta1 or autoscaling/v1.
-	// Users must roll forward while using 1.2, because we will require the latter for 1.3.
-	if !apiGroupVersionOverrides["autoscaling/v1"].Disable {
-		glog.Infof("Configuring autoscaling/v1 storage destination")
-		autoscalingGroup, err := registered.Group(autoscaling.GroupName)
-		if err != nil {
-			glog.Fatalf("Autoscaling API is enabled in runtime config, but not enabled in the environment variable KUBE_API_VERSIONS. Error: %v", err)
-		}
-		// Figure out what storage group/version we should use.
-		storageGroupVersion, found := storageVersions[autoscalingGroup.GroupVersion.Group]
-		if !found {
-			glog.Fatalf("Couldn't find the storage version for group: %q in storageVersions: %v", autoscalingGroup.GroupVersion.Group, storageVersions)
-		}
-
-		if storageGroupVersion != "autoscaling/v1" && storageGroupVersion != "extensions/v1beta1" {
-			glog.Fatalf("The storage version for autoscaling must be either 'autoscaling/v1' or 'extensions/v1beta1'")
-		}
-		glog.Infof("Using %v for autoscaling group storage version", storageGroupVersion)
-		autoscalingEtcdStorage, err := newEtcd(api.Codecs, storageGroupVersion, "extensions/__internal", s.EtcdConfig)
-		if err != nil {
-			glog.Fatalf("Invalid extensions storage version or misconfigured etcd: %v", err)
-		}
-		storageDestinations.AddAPIGroup(autoscaling.GroupName, autoscalingEtcdStorage)
-	}
-
-	// batch/v1/job is a move from extensions/v1beta1/job. The storage
-	// version needs to be either extensions/v1beta1 or batch/v1. Users
-	// must roll forward while using 1.2, because we will require the
-	// latter for 1.3.
-	if !apiGroupVersionOverrides["batch/v1"].Disable {
-		glog.Infof("Configuring batch/v1 storage destination")
-		batchGroup, err := registered.Group(batch.GroupName)
-		if err != nil {
-			glog.Fatalf("Batch API is enabled in runtime config, but not enabled in the environment variable KUBE_API_VERSIONS. Error: %v", err)
-		}
-		// Figure out what storage group/version we should use.
-		storageGroupVersion, found := storageVersions[batchGroup.GroupVersion.Group]
-		if !found {
-			glog.Fatalf("Couldn't find the storage version for group: %q in storageVersions: %v", batchGroup.GroupVersion.Group, storageVersions)
-		}
-
-		if storageGroupVersion != "batch/v1" && storageGroupVersion != "extensions/v1beta1" {
-			glog.Fatalf("The storage version for batch must be either 'batch/v1' or 'extensions/v1beta1'")
-		}
-		glog.Infof("Using %v for batch group storage version", storageGroupVersion)
-		batchEtcdStorage, err := newEtcd(api.Codecs, storageGroupVersion, "extensions/__internal", s.EtcdConfig)
-		if err != nil {
-			glog.Fatalf("Invalid extensions storage version or misconfigured etcd: %v", err)
-		}
-		storageDestinations.AddAPIGroup(batch.GroupName, batchEtcdStorage)
-	}
-
-	updateEtcdOverrides(s.EtcdServersOverrides, storageVersions, s.EtcdConfig, &storageDestinations, newEtcd)
-
-	n := s.ServiceClusterIPRange
-
-	// Default to the private server key for service account token signing
-	if s.ServiceAccountKeyFile == "" && s.TLSPrivateKeyFile != "" {
-		if authenticator.IsValidServiceAccountKeyFile(s.TLSPrivateKeyFile) {
-			s.ServiceAccountKeyFile = s.TLSPrivateKeyFile
-		} else {
-			glog.Warning("No RSA key provided, service account token authentication disabled")
-		}
-	}
-
-	var serviceAccountGetter serviceaccount.ServiceAccountTokenGetter
-	if s.ServiceAccountLookup {
-		// If we need to look up service accounts and tokens,
-		// go directly to etcd to avoid recursive auth insanity
-		serviceAccountGetter = serviceaccountcontroller.NewGetterFromStorageInterface(etcdStorage)
-	}
-
-	authenticator, err := authenticator.New(authenticator.AuthenticatorConfig{
-		BasicAuthFile:             s.BasicAuthFile,
-		ClientCAFile:              s.ClientCAFile,
-		TokenAuthFile:             s.TokenAuthFile,
-		OIDCIssuerURL:             s.OIDCIssuerURL,
-		OIDCClientID:              s.OIDCClientID,
-		OIDCCAFile:                s.OIDCCAFile,
-		OIDCUsernameClaim:         s.OIDCUsernameClaim,
-		OIDCGroupsClaim:           s.OIDCGroupsClaim,
-		ServiceAccountKeyFile:     s.ServiceAccountKeyFile,
-		ServiceAccountLookup:      s.ServiceAccountLookup,
-		ServiceAccountTokenGetter: serviceAccountGetter,
-		KeystoneURL:               s.KeystoneURL,
-	})
-
-	if err != nil {
-		glog.Fatalf("Invalid Authentication Config: %v", err)
-	}
-
-	authorizationModeNames := strings.Split(s.AuthorizationMode, ",")
-	authorizer, err := apiserver.NewAuthorizerFromAuthorizationConfig(authorizationModeNames, s.AuthorizationConfig)
-	if err != nil {
-		glog.Fatalf("Invalid Authorization Config: %v", err)
-	}
-
-	admissionControlPluginNames := strings.Split(s.AdmissionControl, ",")
-	admissionController := admission.NewFromPlugins(client, admissionControlPluginNames, s.AdmissionControlConfigFile)
-
-	if len(s.ExternalHost) == 0 {
-		// TODO: extend for other providers
-		if s.CloudProvider == "gce" {
-			instances, supported := cloud.Instances()
-			if !supported {
-				glog.Fatalf("GCE cloud provider has no instances.  this shouldn't happen. exiting.")
-			}
-			name, err := os.Hostname()
-			if err != nil {
-				glog.Fatalf("Failed to get hostname: %v", err)
-			}
-			addrs, err := instances.NodeAddresses(name)
-			if err != nil {
-				glog.Warningf("Unable to obtain external host address from cloud provider: %v", err)
-			} else {
-				for _, addr := range addrs {
-					if addr.Type == api.NodeExternalIP {
-						s.ExternalHost = addr.Address
-					}
-				}
-			}
-		}
+		return nil, nil, nil, nil, nil, err
 	}
 
 	config := &master.Config{
-		Config: &genericapiserver.Config{
-			StorageDestinations:       storageDestinations,
-			StorageVersions:           storageVersions,
-			ServiceClusterIPRange:     &n,
-			EnableLogsSupport:         s.EnableLogsSupport,
-			EnableUISupport:           true,
-			EnableSwaggerSupport:      true,
-			EnableProfiling:           s.EnableProfiling,
-			EnableWatchCache:          s.EnableWatchCache,
-			EnableIndex:               true,
-			APIPrefix:                 s.APIPrefix,
-			APIGroupPrefix:            s.APIGroupPrefix,
-			CorsAllowedOriginList:     s.CorsAllowedOriginList,
-			ReadWritePort:             s.SecurePort,
-			PublicAddress:             s.AdvertiseAddress,
-			Authenticator:             authenticator,
-			SupportsBasicAuth:         len(s.BasicAuthFile) > 0,
-			Authorizer:                authorizer,
-			AdmissionControl:          admissionController,
-			APIGroupVersionOverrides:  apiGroupVersionOverrides,
-			MasterServiceNamespace:    s.MasterServiceNamespace,
-			MasterCount:               s.MasterCount,
-			ExternalHost:              s.ExternalHost,
-			MinRequestTimeout:         s.MinRequestTimeout,
-			ProxyDialer:               proxyDialerFn,
-			ProxyTLSClientConfig:      proxyTLSClientConfig,
+		GenericConfig: genericConfig,
+		ExtraConfig: master.ExtraConfig{
+			ClientCARegistrationHook: master.ClientCARegistrationHook{
+				ClientCA:                         clientCA,
+				RequestHeaderUsernameHeaders:     s.Authentication.RequestHeader.UsernameHeaders,
+				RequestHeaderGroupHeaders:        s.Authentication.RequestHeader.GroupHeaders,
+				RequestHeaderExtraHeaderPrefixes: s.Authentication.RequestHeader.ExtraHeaderPrefixes,
+				RequestHeaderCA:                  requestHeaderProxyCA,
+				RequestHeaderAllowedNames:        s.Authentication.RequestHeader.AllowedNames,
+			},
+
+			APIResourceConfigSource: storageFactory.APIResourceConfigSource,
+			StorageFactory:          storageFactory,
+			EnableCoreControllers:   true,
+			EventTTL:                s.EventTTL,
+			KubeletClientConfig:     s.KubeletConfig,
+			EnableUISupport:         true,
+			EnableLogsSupport:       s.EnableLogsHandler,
+			ProxyTransport:          proxyTransport,
+
+			Tunneler: nodeTunneler,
+
+			ServiceIPRange:       serviceIPRange,
+			APIServerServiceIP:   apiServerServiceIP,
+			APIServerServicePort: 443,
+
 			ServiceNodePortRange:      s.ServiceNodePortRange,
 			KubernetesServiceNodePort: s.KubernetesServiceNodePort,
-			Serializer:                api.Codecs,
+
+			EndpointReconcilerType: reconcilers.Type(s.EndpointReconcilerType),
+			MasterCount:            s.MasterCount,
 		},
-		EnableCoreControllers:   true,
-		DeleteCollectionWorkers: s.DeleteCollectionWorkers,
-		EventTTL:                s.EventTTL,
-		KubeletClient:           kubeletClient,
-
-		Tunneler: tunneler,
 	}
 
-	if s.EnableWatchCache {
-		cachesize.SetWatchCacheSizes(s.WatchCacheSizes)
+	if nodeTunneler != nil {
+		// Use the nodeTunneler's dialer to connect to the kubelet
+		config.ExtraConfig.KubeletClientConfig.Dial = nodeTunneler.Dial
 	}
 
-	m, err := master.New(config)
+	return config, sharedInformers, versionedInformers, insecureServingOptions, serviceResolver, nil
+}
+
+// BuildGenericConfig takes the master server options and produces the genericapiserver.Config associated with it
+func BuildGenericConfig(s *options.ServerRunOptions, proxyTransport *http.Transport) (*genericapiserver.Config, informers.SharedInformerFactory, clientgoinformers.SharedInformerFactory, *kubeserver.InsecureServingInfo, aggregatorapiserver.ServiceResolver, error) {
+	genericConfig := genericapiserver.NewConfig(legacyscheme.Codecs)
+	if err := s.GenericServerRunOptions.ApplyTo(genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	insecureServingOptions, err := s.InsecureServing.ApplyTo(genericConfig)
 	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := s.SecureServing.ApplyTo(genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := s.Authentication.ApplyTo(genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := s.Audit.ApplyTo(genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := s.Features.ApplyTo(genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, legacyscheme.Scheme)
+	genericConfig.OpenAPIConfig.PostProcessSpec = postProcessOpenAPISpecForBackwardCompatibility
+	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
+	genericConfig.SwaggerConfig = genericapiserver.DefaultSwaggerConfig()
+	genericConfig.EnableMetrics = true
+	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
+		sets.NewString("watch", "proxy"),
+		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
+	)
+
+	kubeVersion := version.Get()
+	genericConfig.Version = &kubeVersion
+
+	storageFactory, err := BuildStorageFactory(s)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	if err := s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	// Use protobufs for self-communication.
+	// Since not every generic apiserver has to support protobufs, we
+	// cannot default to it in generic apiserver and need to explicitly
+	// set it in kube-apiserver.
+	genericConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
+
+	client, err := internalclientset.NewForConfig(genericConfig.LoopbackClientConfig)
+	if err != nil {
+		kubeAPIVersions := os.Getenv("KUBE_API_VERSIONS")
+		if len(kubeAPIVersions) == 0 {
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to create clientset: %v", err)
+		}
+
+		// KUBE_API_VERSIONS is used in test-update-storage-objects.sh, disabling a number of API
+		// groups. This leads to a nil client above and undefined behaviour further down.
+		//
+		// TODO: get rid of KUBE_API_VERSIONS or define sane behaviour if set
+		glog.Errorf("Failed to create clientset with KUBE_API_VERSIONS=%q. KUBE_API_VERSIONS is only for testing. Things will break.", kubeAPIVersions)
+	}
+
+	kubeClientConfig := genericConfig.LoopbackClientConfig
+	sharedInformers := informers.NewSharedInformerFactory(client, 10*time.Minute)
+	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to create real external clientset: %v", err)
+	}
+	versionedInformers := clientgoinformers.NewSharedInformerFactory(clientgoExternalClient, 10*time.Minute)
+
+	var serviceResolver aggregatorapiserver.ServiceResolver
+	if s.EnableAggregatorRouting {
+		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(
+			versionedInformers.Core().V1().Services().Lister(),
+			versionedInformers.Core().V1().Endpoints().Lister(),
+		)
+	} else {
+		serviceResolver = aggregatorapiserver.NewClusterIPServiceResolver(
+			versionedInformers.Core().V1().Services().Lister(),
+		)
+	}
+
+	genericConfig.Authenticator, genericConfig.OpenAPIConfig.SecurityDefinitions, err = BuildAuthenticator(s, storageFactory, client, sharedInformers)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid authentication config: %v", err)
+	}
+
+	genericConfig.Authorizer, genericConfig.RuleResolver, err = BuildAuthorizer(s, sharedInformers)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("invalid authorization config: %v", err)
+	}
+	if !sets.NewString(s.Authorization.Modes()...).Has(modes.ModeRBAC) {
+		genericConfig.DisabledPostStartHooks.Insert(rbacrest.PostStartHookName)
+	}
+
+	pluginInitializer, err := BuildAdmissionPluginInitializer(
+		s,
+		client,
+		sharedInformers,
+		serviceResolver,
+	)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to create admission plugin initializer: %v", err)
+	}
+
+	webhookClientConfig := rest.AnonymousClientConfig(genericConfig.LoopbackClientConfig)
+	if proxyTransport != nil && proxyTransport.Dial != nil {
+		webhookClientConfig.Dial = proxyTransport.Dial
+	}
+	// TODO: this is the wrong cert/key pair.
+	// Given the generic case of webhook admission from a generic apiserver,
+	// this key pair should be signed by the the API server's client CA.
+	// Read client cert/key for plugins that need to make calls out
+	certBytes, keyBytes := []byte{}, []byte{}
+	if len(s.ProxyClientCertFile) > 0 && len(s.ProxyClientKeyFile) > 0 {
+		var err error
+		certBytes, err = ioutil.ReadFile(s.ProxyClientCertFile)
+		if err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to read proxy client cert file from: %s, err: %v", s.ProxyClientCertFile, err)
+		}
+		keyBytes, err = ioutil.ReadFile(s.ProxyClientKeyFile)
+		if err != nil {
+			return nil, nil, nil, nil, nil, fmt.Errorf("failed to read proxy client key file from: %s, err: %v", s.ProxyClientKeyFile, err)
+		}
+		webhookClientConfig.TLSClientConfig.CertData = certBytes
+		webhookClientConfig.TLSClientConfig.KeyData = keyBytes
+	}
+	webhookClientConfig.UserAgent = "kube-apiserver-admission"
+	webhookClientConfig.Timeout = 30 * time.Second
+
+	err = s.Admission.ApplyTo(
+		genericConfig,
+		versionedInformers,
+		kubeClientConfig,
+		webhookClientConfig,
+		legacyscheme.Scheme,
+		pluginInitializer)
+	if err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("failed to initialize admission: %v", err)
+	}
+	return genericConfig, sharedInformers, versionedInformers, insecureServingOptions, serviceResolver, nil
+}
+
+// BuildAdmissionPluginInitializer constructs the admission plugin initializer
+func BuildAdmissionPluginInitializer(s *options.ServerRunOptions, client internalclientset.Interface, sharedInformers informers.SharedInformerFactory, serviceResolver aggregatorapiserver.ServiceResolver) (admission.PluginInitializer, error) {
+	var cloudConfig []byte
+
+	if s.CloudProvider.CloudConfigFile != "" {
+		var err error
+		cloudConfig, err = ioutil.ReadFile(s.CloudProvider.CloudConfigFile)
+		if err != nil {
+			glog.Fatalf("Error reading from cloud configuration file %s: %#v", s.CloudProvider.CloudConfigFile, err)
+		}
+	}
+
+	// TODO: use a dynamic restmapper. See https://github.com/kubernetes/kubernetes/pull/42615.
+	restMapper := legacyscheme.Registry.RESTMapper()
+
+	// NOTE: we do not provide informers to the quota registry because admission level decisions
+	// do not require us to open watches for all items tracked by quota.
+	quotaRegistry := quotainstall.NewRegistry(nil, nil)
+
+	pluginInitializer := kubeapiserveradmission.NewPluginInitializer(client, sharedInformers, cloudConfig, restMapper, quotaRegistry)
+
+	pluginInitializer = pluginInitializer.SetServiceResolver(serviceResolver)
+
+	return pluginInitializer, nil
+}
+
+// BuildAuthenticator constructs the authenticator
+func BuildAuthenticator(s *options.ServerRunOptions, storageFactory serverstorage.StorageFactory, client internalclientset.Interface, sharedInformers informers.SharedInformerFactory) (authenticator.Request, *spec.SecurityDefinitions, error) {
+	authenticatorConfig := s.Authentication.ToAuthenticationConfig()
+	if s.Authentication.ServiceAccounts.Lookup {
+		// we have to go direct to storage because the clientsets fail when they're initialized with some API versions excluded
+		// we should stop trying to control them like that.
+		storageConfigServiceAccounts, err := storageFactory.NewConfig(api.Resource("serviceaccounts"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get serviceaccounts storage: %v", err)
+		}
+		storageConfigSecrets, err := storageFactory.NewConfig(api.Resource("secrets"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get secrets storage: %v", err)
+		}
+		authenticatorConfig.ServiceAccountTokenGetter = serviceaccountcontroller.NewGetterFromStorageInterface(
+			storageConfigServiceAccounts,
+			storageFactory.ResourcePrefix(api.Resource("serviceaccounts")),
+			storageConfigSecrets,
+			storageFactory.ResourcePrefix(api.Resource("secrets")),
+		)
+	}
+	if client == nil || reflect.ValueOf(client).IsNil() {
+		// TODO: Remove check once client can never be nil.
+		glog.Errorf("Failed to setup bootstrap token authenticator because the loopback clientset was not setup properly.")
+	} else {
+		authenticatorConfig.BootstrapTokenAuthenticator = bootstrap.NewTokenAuthenticator(
+			sharedInformers.Core().InternalVersion().Secrets().Lister().Secrets(v1.NamespaceSystem),
+		)
+	}
+	return authenticatorConfig.New()
+}
+
+// BuildAuthorizer constructs the authorizer
+func BuildAuthorizer(s *options.ServerRunOptions, sharedInformers informers.SharedInformerFactory) (authorizer.Authorizer, authorizer.RuleResolver, error) {
+	authorizationConfig := s.Authorization.ToAuthorizationConfig(sharedInformers)
+	return authorizationConfig.New()
+}
+
+// BuildStorageFactory constructs the storage factory. If encryption at rest is used, it expects
+// all supported KMS plugins to be registered in the KMS plugin registry before being called.
+func BuildStorageFactory(s *options.ServerRunOptions) (*serverstorage.DefaultStorageFactory, error) {
+	storageGroupsToEncodingVersion, err := s.StorageSerialization.StorageGroupsToEncodingVersion()
+	if err != nil {
+		return nil, fmt.Errorf("error generating storage version map: %s", err)
+	}
+	storageFactory, err := kubeapiserver.NewStorageFactory(
+		s.Etcd.StorageConfig, s.Etcd.DefaultStorageMediaType, legacyscheme.Codecs,
+		serverstorage.NewDefaultResourceEncodingConfig(legacyscheme.Registry), storageGroupsToEncodingVersion,
+		// FIXME (soltysh): this GroupVersionResource override should be configurable
+		[]schema.GroupVersionResource{batch.Resource("cronjobs").WithVersion("v1beta1")},
+		master.DefaultAPIResourceConfigSource(), s.APIEnablement.RuntimeConfig)
+	if err != nil {
+		return nil, fmt.Errorf("error in initializing storage factory: %s", err)
+	}
+
+	// keep Deployments, NetworkPolicies, Daemonsets and ReplicaSets in extensions for backwards compatibility, we'll have to migrate at some point, eventually
+	storageFactory.AddCohabitatingResources(extensions.Resource("deployments"), apps.Resource("deployments"))
+	storageFactory.AddCohabitatingResources(extensions.Resource("daemonsets"), apps.Resource("daemonsets"))
+	storageFactory.AddCohabitatingResources(extensions.Resource("replicasets"), apps.Resource("replicasets"))
+	storageFactory.AddCohabitatingResources(extensions.Resource("networkpolicies"), networking.Resource("networkpolicies"))
+	for _, override := range s.Etcd.EtcdServersOverrides {
+		tokens := strings.Split(override, "#")
+		if len(tokens) != 2 {
+			glog.Errorf("invalid value of etcd server overrides: %s", override)
+			continue
+		}
+
+		apiresource := strings.Split(tokens[0], "/")
+		if len(apiresource) != 2 {
+			glog.Errorf("invalid resource definition: %s", tokens[0])
+			continue
+		}
+		group := apiresource[0]
+		resource := apiresource[1]
+		groupResource := schema.GroupResource{Group: group, Resource: resource}
+
+		servers := strings.Split(tokens[1], ";")
+		storageFactory.SetEtcdLocation(groupResource, servers)
+	}
+
+	if len(s.Etcd.EncryptionProviderConfigFilepath) != 0 {
+		transformerOverrides, err := encryptionconfig.GetTransformerOverrides(s.Etcd.EncryptionProviderConfigFilepath)
+		if err != nil {
+			return nil, err
+		}
+		for groupResource, transformer := range transformerOverrides {
+			storageFactory.SetTransformer(groupResource, transformer)
+		}
+	}
+
+	return storageFactory, nil
+}
+
+func defaultOptions(s *options.ServerRunOptions) error {
+	// set defaults
+	if err := s.GenericServerRunOptions.DefaultAdvertiseAddress(s.SecureServing); err != nil {
 		return err
 	}
+	if err := kubeoptions.DefaultAdvertiseAddress(s.GenericServerRunOptions, s.InsecureServing); err != nil {
+		return err
+	}
+	_, apiServerServiceIP, err := master.DefaultServiceIPRange(s.ServiceClusterIPRange)
+	if err != nil {
+		return fmt.Errorf("error determining service IP ranges: %v", err)
+	}
+	if err := s.SecureServing.MaybeDefaultWithSelfSignedCerts(s.GenericServerRunOptions.AdvertiseAddress.String(), []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes"}, []net.IP{apiServerServiceIP}); err != nil {
+		return fmt.Errorf("error creating self-signed certificates: %v", err)
+	}
+	if err := s.CloudProvider.DefaultExternalHost(s.GenericServerRunOptions); err != nil {
+		return fmt.Errorf("error setting the external host value: %v", err)
+	}
 
-	m.Run(s.ServerRunOptions)
+	s.Authentication.ApplyAuthorization(s.Authorization)
+
+	// Default to the private server key for service account token signing
+	if len(s.Authentication.ServiceAccounts.KeyFiles) == 0 && s.SecureServing.ServerCert.CertKey.KeyFile != "" {
+		if kubeauthenticator.IsValidServiceAccountKeyFile(s.SecureServing.ServerCert.CertKey.KeyFile) {
+			s.Authentication.ServiceAccounts.KeyFiles = []string{s.SecureServing.ServerCert.CertKey.KeyFile}
+		} else {
+			glog.Warning("No TLS key provided, service account token authentication disabled")
+		}
+	}
+
+	if s.Etcd.StorageConfig.DeserializationCacheSize == 0 {
+		// When size of cache is not explicitly set, estimate its size based on
+		// target memory usage.
+		glog.V(2).Infof("Initializing deserialization cache size based on %dMB limit", s.GenericServerRunOptions.TargetRAMMB)
+
+		// This is the heuristics that from memory capacity is trying to infer
+		// the maximum number of nodes in the cluster and set cache sizes based
+		// on that value.
+		// From our documentation, we officially recommend 120GB machines for
+		// 2000 nodes, and we scale from that point. Thus we assume ~60MB of
+		// capacity per node.
+		// TODO: We may consider deciding that some percentage of memory will
+		// be used for the deserialization cache and divide it by the max object
+		// size to compute its size. We may even go further and measure
+		// collective sizes of the objects in the cache.
+		clusterSize := s.GenericServerRunOptions.TargetRAMMB / 60
+		s.Etcd.StorageConfig.DeserializationCacheSize = 25 * clusterSize
+		if s.Etcd.StorageConfig.DeserializationCacheSize < 1000 {
+			s.Etcd.StorageConfig.DeserializationCacheSize = 1000
+		}
+	}
+	if s.Etcd.EnableWatchCache {
+		glog.V(2).Infof("Initializing cache sizes based on %dMB limit", s.GenericServerRunOptions.TargetRAMMB)
+		sizes := cachesize.NewHeuristicWatchCacheSizes(s.GenericServerRunOptions.TargetRAMMB)
+		if userSpecified, err := serveroptions.ParseWatchCacheSizes(s.Etcd.WatchCacheSizes); err == nil {
+			for resource, size := range userSpecified {
+				sizes[resource] = size
+			}
+		}
+		s.Etcd.WatchCacheSizes, err = serveroptions.WriteWatchCacheSizes(sizes)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
-func getRuntimeConfigValue(s *options.APIServer, apiKey string, defaultValue bool) bool {
-	flagValue, ok := s.RuntimeConfig[apiKey]
-	if ok {
-		if flagValue == "" {
-			return true
-		}
-		boolValue, err := strconv.ParseBool(flagValue)
-		if err != nil {
-			glog.Fatalf("Invalid value of %s: %s, err: %v", apiKey, flagValue, err)
-		}
-		return boolValue
+func readCAorNil(file string) ([]byte, error) {
+	if len(file) == 0 {
+		return nil, nil
 	}
-	return defaultValue
+	return ioutil.ReadFile(file)
 }
 
-// Parses the given runtime-config and formats it into map[string]ApiGroupVersionOverride
-func parseRuntimeConfig(s *options.APIServer) (map[string]genericapiserver.APIGroupVersionOverride, error) {
-	// "api/all=false" allows users to selectively enable specific api versions.
-	disableAllAPIs := false
-	allAPIFlagValue, ok := s.RuntimeConfig["api/all"]
-	if ok && allAPIFlagValue == "false" {
-		disableAllAPIs = true
+// PostProcessSpec adds removed definitions for backward compatibility
+func postProcessOpenAPISpecForBackwardCompatibility(s *spec.Swagger) (*spec.Swagger, error) {
+	compatibilityMap := map[string]string{
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.SelfSubjectAccessReview":                         "io.k8s.api.authorization.v1beta1.SelfSubjectAccessReview",
+		"io.k8s.kubernetes.pkg.api.v1.GitRepoVolumeSource":                                                 "io.k8s.api.core.v1.GitRepoVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.ExternalAdmissionHookConfigurationList": "io.k8s.api.admissionregistration.v1alpha1.ExternalAdmissionHookConfigurationList",
+		"io.k8s.kubernetes.pkg.api.v1.EndpointPort":                                                        "io.k8s.api.core.v1.EndpointPort",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.SupplementalGroupsStrategyOptions":                  "io.k8s.api.extensions.v1beta1.SupplementalGroupsStrategyOptions",
+		"io.k8s.kubernetes.pkg.api.v1.PodStatus":                                                           "io.k8s.api.core.v1.PodStatus",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.RoleBindingList":                                          "io.k8s.api.rbac.v1beta1.RoleBindingList",
+		"io.k8s.kubernetes.pkg.apis.policy.v1beta1.PodDisruptionBudgetSpec":                                "io.k8s.api.policy.v1beta1.PodDisruptionBudgetSpec",
+		"io.k8s.kubernetes.pkg.api.v1.HTTPGetAction":                                                       "io.k8s.api.core.v1.HTTPGetAction",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.ResourceAttributes":                                   "io.k8s.api.authorization.v1.ResourceAttributes",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeList":                                                "io.k8s.api.core.v1.PersistentVolumeList",
+		"io.k8s.kubernetes.pkg.apis.batch.v2alpha1.CronJobSpec":                                            "io.k8s.api.batch.v2alpha1.CronJobSpec",
+		"io.k8s.kubernetes.pkg.api.v1.CephFSVolumeSource":                                                  "io.k8s.api.core.v1.CephFSVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.Affinity":                                                            "io.k8s.api.core.v1.Affinity",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.PolicyRule":                                               "io.k8s.api.rbac.v1beta1.PolicyRule",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DaemonSetSpec":                                      "io.k8s.api.extensions.v1beta1.DaemonSetSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ProjectedVolumeSource":                                               "io.k8s.api.core.v1.ProjectedVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.TCPSocketAction":                                                     "io.k8s.api.core.v1.TCPSocketAction",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DaemonSet":                                          "io.k8s.api.extensions.v1beta1.DaemonSet",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressList":                                        "io.k8s.api.extensions.v1beta1.IngressList",
+		"io.k8s.kubernetes.pkg.api.v1.PodSpec":                                                             "io.k8s.api.core.v1.PodSpec",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1.TokenReview":                                         "io.k8s.api.authentication.v1.TokenReview",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.SubjectAccessReview":                             "io.k8s.api.authorization.v1beta1.SubjectAccessReview",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.ClusterRoleBinding":                                      "io.k8s.api.rbac.v1alpha1.ClusterRoleBinding",
+		"io.k8s.kubernetes.pkg.api.v1.Node":                                                                "io.k8s.api.core.v1.Node",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.ServiceReference":                       "io.k8s.api.admissionregistration.v1alpha1.ServiceReference",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentStatus":                                   "io.k8s.api.extensions.v1beta1.DeploymentStatus",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.RoleRef":                                                  "io.k8s.api.rbac.v1beta1.RoleRef",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.Scale":                                                    "io.k8s.api.apps.v1beta1.Scale",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.InitializerConfiguration":               "io.k8s.api.admissionregistration.v1alpha1.InitializerConfiguration",
+		"io.k8s.kubernetes.pkg.api.v1.PhotonPersistentDiskVolumeSource":                                    "io.k8s.api.core.v1.PhotonPersistentDiskVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.PreferredSchedulingTerm":                                             "io.k8s.api.core.v1.PreferredSchedulingTerm",
+		"io.k8s.kubernetes.pkg.apis.batch.v1.JobSpec":                                                      "io.k8s.api.batch.v1.JobSpec",
+		"io.k8s.kubernetes.pkg.api.v1.EventSource":                                                         "io.k8s.api.core.v1.EventSource",
+		"io.k8s.kubernetes.pkg.api.v1.Container":                                                           "io.k8s.api.core.v1.Container",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.AdmissionHookClientConfig":              "io.k8s.api.admissionregistration.v1alpha1.AdmissionHookClientConfig",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceQuota":                                                       "io.k8s.api.core.v1.ResourceQuota",
+		"io.k8s.kubernetes.pkg.api.v1.SecretList":                                                          "io.k8s.api.core.v1.SecretList",
+		"io.k8s.kubernetes.pkg.api.v1.NodeSystemInfo":                                                      "io.k8s.api.core.v1.NodeSystemInfo",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.PolicyRule":                                              "io.k8s.api.rbac.v1alpha1.PolicyRule",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ReplicaSetSpec":                                     "io.k8s.api.extensions.v1beta1.ReplicaSetSpec",
+		"io.k8s.kubernetes.pkg.api.v1.NodeStatus":                                                          "io.k8s.api.core.v1.NodeStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceQuotaList":                                                   "io.k8s.api.core.v1.ResourceQuotaList",
+		"io.k8s.kubernetes.pkg.api.v1.HostPathVolumeSource":                                                "io.k8s.api.core.v1.HostPathVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.certificates.v1beta1.CertificateSigningRequest":                        "io.k8s.api.certificates.v1beta1.CertificateSigningRequest",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressRule":                                        "io.k8s.api.extensions.v1beta1.IngressRule",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicyPeer":                                  "io.k8s.api.extensions.v1beta1.NetworkPolicyPeer",
+		"io.k8s.kubernetes.pkg.apis.storage.v1.StorageClass":                                               "io.k8s.api.storage.v1.StorageClass",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicyPeer":                                       "io.k8s.api.networking.v1.NetworkPolicyPeer",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicyIngressRule":                                "io.k8s.api.networking.v1.NetworkPolicyIngressRule",
+		"io.k8s.kubernetes.pkg.api.v1.StorageOSPersistentVolumeSource":                                     "io.k8s.api.core.v1.StorageOSPersistentVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicyIngressRule":                           "io.k8s.api.extensions.v1beta1.NetworkPolicyIngressRule",
+		"io.k8s.kubernetes.pkg.api.v1.PodAffinity":                                                         "io.k8s.api.core.v1.PodAffinity",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.RollbackConfig":                                     "io.k8s.api.extensions.v1beta1.RollbackConfig",
+		"io.k8s.kubernetes.pkg.api.v1.PodList":                                                             "io.k8s.api.core.v1.PodList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ScaleStatus":                                        "io.k8s.api.extensions.v1beta1.ScaleStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ComponentCondition":                                                  "io.k8s.api.core.v1.ComponentCondition",
+		"io.k8s.kubernetes.pkg.apis.certificates.v1beta1.CertificateSigningRequestList":                    "io.k8s.api.certificates.v1beta1.CertificateSigningRequestList",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.ClusterRoleBindingList":                                  "io.k8s.api.rbac.v1alpha1.ClusterRoleBindingList",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.HorizontalPodAutoscalerCondition":                 "io.k8s.api.autoscaling.v2alpha1.HorizontalPodAutoscalerCondition",
+		"io.k8s.kubernetes.pkg.api.v1.ServiceList":                                                         "io.k8s.api.core.v1.ServiceList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.PodSecurityPolicy":                                  "io.k8s.api.extensions.v1beta1.PodSecurityPolicy",
+		"io.k8s.kubernetes.pkg.apis.batch.v1.JobCondition":                                                 "io.k8s.api.batch.v1.JobCondition",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentStatus":                                         "io.k8s.api.apps.v1beta1.DeploymentStatus",
+		"io.k8s.kubernetes.pkg.api.v1.Volume":                                                              "io.k8s.api.core.v1.Volume",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.RoleBindingList":                                         "io.k8s.api.rbac.v1alpha1.RoleBindingList",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.Rule":                                   "io.k8s.api.admissionregistration.v1alpha1.Rule",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.InitializerConfigurationList":           "io.k8s.api.admissionregistration.v1alpha1.InitializerConfigurationList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicy":                                      "io.k8s.api.extensions.v1beta1.NetworkPolicy",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.ClusterRoleList":                                         "io.k8s.api.rbac.v1alpha1.ClusterRoleList",
+		"io.k8s.kubernetes.pkg.api.v1.ObjectFieldSelector":                                                 "io.k8s.api.core.v1.ObjectFieldSelector",
+		"io.k8s.kubernetes.pkg.api.v1.EventList":                                                           "io.k8s.api.core.v1.EventList",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.MetricStatus":                                     "io.k8s.api.autoscaling.v2alpha1.MetricStatus",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicyPort":                                       "io.k8s.api.networking.v1.NetworkPolicyPort",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.RoleList":                                                 "io.k8s.api.rbac.v1beta1.RoleList",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.RoleList":                                                "io.k8s.api.rbac.v1alpha1.RoleList",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentStrategy":                                       "io.k8s.api.apps.v1beta1.DeploymentStrategy",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.CrossVersionObjectReference":                            "io.k8s.api.autoscaling.v1.CrossVersionObjectReference",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMapProjection":                                                 "io.k8s.api.core.v1.ConfigMapProjection",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.CrossVersionObjectReference":                      "io.k8s.api.autoscaling.v2alpha1.CrossVersionObjectReference",
+		"io.k8s.kubernetes.pkg.api.v1.LoadBalancerStatus":                                                  "io.k8s.api.core.v1.LoadBalancerStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ISCSIVolumeSource":                                                   "io.k8s.api.core.v1.ISCSIVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.ControllerRevisionList":                                   "io.k8s.api.apps.v1beta1.ControllerRevisionList",
+		"io.k8s.kubernetes.pkg.api.v1.EndpointSubset":                                                      "io.k8s.api.core.v1.EndpointSubset",
+		"io.k8s.kubernetes.pkg.api.v1.SELinuxOptions":                                                      "io.k8s.api.core.v1.SELinuxOptions",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeClaimVolumeSource":                                   "io.k8s.api.core.v1.PersistentVolumeClaimVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.MetricSpec":                                       "io.k8s.api.autoscaling.v2alpha1.MetricSpec",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.StatefulSetList":                                          "io.k8s.api.apps.v1beta1.StatefulSetList",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.ResourceAttributes":                              "io.k8s.api.authorization.v1beta1.ResourceAttributes",
+		"io.k8s.kubernetes.pkg.api.v1.Capabilities":                                                        "io.k8s.api.core.v1.Capabilities",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.Deployment":                                         "io.k8s.api.extensions.v1beta1.Deployment",
+		"io.k8s.kubernetes.pkg.api.v1.Binding":                                                             "io.k8s.api.core.v1.Binding",
+		"io.k8s.kubernetes.pkg.api.v1.ReplicationControllerList":                                           "io.k8s.api.core.v1.ReplicationControllerList",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.SelfSubjectAccessReview":                              "io.k8s.api.authorization.v1.SelfSubjectAccessReview",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1beta1.UserInfo":                                       "io.k8s.api.authentication.v1beta1.UserInfo",
+		"io.k8s.kubernetes.pkg.api.v1.HostAlias":                                                           "io.k8s.api.core.v1.HostAlias",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.StatefulSetUpdateStrategy":                                "io.k8s.api.apps.v1beta1.StatefulSetUpdateStrategy",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressSpec":                                        "io.k8s.api.extensions.v1beta1.IngressSpec",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentCondition":                                "io.k8s.api.extensions.v1beta1.DeploymentCondition",
+		"io.k8s.kubernetes.pkg.api.v1.GCEPersistentDiskVolumeSource":                                       "io.k8s.api.core.v1.GCEPersistentDiskVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.ExternalAdmissionHook":                  "io.k8s.api.admissionregistration.v1alpha1.ExternalAdmissionHook",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.Scale":                                              "io.k8s.api.extensions.v1beta1.Scale",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.HorizontalPodAutoscalerStatus":                    "io.k8s.api.autoscaling.v2alpha1.HorizontalPodAutoscalerStatus",
+		"io.k8s.kubernetes.pkg.api.v1.FlexVolumeSource":                                                    "io.k8s.api.core.v1.FlexVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.RollingUpdateDeployment":                            "io.k8s.api.extensions.v1beta1.RollingUpdateDeployment",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.ObjectMetricStatus":                               "io.k8s.api.autoscaling.v2alpha1.ObjectMetricStatus",
+		"io.k8s.kubernetes.pkg.api.v1.Event":                                                               "io.k8s.api.core.v1.Event",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceQuotaSpec":                                                   "io.k8s.api.core.v1.ResourceQuotaSpec",
+		"io.k8s.kubernetes.pkg.api.v1.Handler":                                                             "io.k8s.api.core.v1.Handler",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressBackend":                                     "io.k8s.api.extensions.v1beta1.IngressBackend",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.Role":                                                    "io.k8s.api.rbac.v1alpha1.Role",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.ObjectMetricSource":                               "io.k8s.api.autoscaling.v2alpha1.ObjectMetricSource",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.ResourceMetricStatus":                             "io.k8s.api.autoscaling.v2alpha1.ResourceMetricStatus",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.HorizontalPodAutoscalerSpec":                            "io.k8s.api.autoscaling.v1.HorizontalPodAutoscalerSpec",
+		"io.k8s.kubernetes.pkg.api.v1.Lifecycle":                                                           "io.k8s.api.core.v1.Lifecycle",
+		"io.k8s.kubernetes.pkg.apis.certificates.v1beta1.CertificateSigningRequestStatus":                  "io.k8s.api.certificates.v1beta1.CertificateSigningRequestStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerStateRunning":                                               "io.k8s.api.core.v1.ContainerStateRunning",
+		"io.k8s.kubernetes.pkg.api.v1.ServiceAccountList":                                                  "io.k8s.api.core.v1.ServiceAccountList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.HostPortRange":                                      "io.k8s.api.extensions.v1beta1.HostPortRange",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.ControllerRevision":                                       "io.k8s.api.apps.v1beta1.ControllerRevision",
+		"io.k8s.kubernetes.pkg.api.v1.ReplicationControllerSpec":                                           "io.k8s.api.core.v1.ReplicationControllerSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerStateTerminated":                                            "io.k8s.api.core.v1.ContainerStateTerminated",
+		"io.k8s.kubernetes.pkg.api.v1.ReplicationControllerStatus":                                         "io.k8s.api.core.v1.ReplicationControllerStatus",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DaemonSetList":                                      "io.k8s.api.extensions.v1beta1.DaemonSetList",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.SelfSubjectAccessReviewSpec":                          "io.k8s.api.authorization.v1.SelfSubjectAccessReviewSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ComponentStatusList":                                                 "io.k8s.api.core.v1.ComponentStatusList",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerStateWaiting":                                               "io.k8s.api.core.v1.ContainerStateWaiting",
+		"io.k8s.kubernetes.pkg.api.v1.VolumeMount":                                                         "io.k8s.api.core.v1.VolumeMount",
+		"io.k8s.kubernetes.pkg.api.v1.Secret":                                                              "io.k8s.api.core.v1.Secret",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.ClusterRoleList":                                          "io.k8s.api.rbac.v1beta1.ClusterRoleList",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMapList":                                                       "io.k8s.api.core.v1.ConfigMapList",
+		"io.k8s.kubernetes.pkg.apis.storage.v1beta1.StorageClassList":                                      "io.k8s.api.storage.v1beta1.StorageClassList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.HTTPIngressPath":                                    "io.k8s.api.extensions.v1beta1.HTTPIngressPath",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.ClusterRole":                                             "io.k8s.api.rbac.v1alpha1.ClusterRole",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.ResourceMetricSource":                             "io.k8s.api.autoscaling.v2alpha1.ResourceMetricSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentRollback":                                 "io.k8s.api.extensions.v1beta1.DeploymentRollback",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeClaimSpec":                                           "io.k8s.api.core.v1.PersistentVolumeClaimSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ReplicationController":                                               "io.k8s.api.core.v1.ReplicationController",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.StatefulSetSpec":                                          "io.k8s.api.apps.v1beta1.StatefulSetSpec",
+		"io.k8s.kubernetes.pkg.api.v1.SecurityContext":                                                     "io.k8s.api.core.v1.SecurityContext",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicySpec":                                       "io.k8s.api.networking.v1.NetworkPolicySpec",
+		"io.k8s.kubernetes.pkg.api.v1.LocalObjectReference":                                                "io.k8s.api.core.v1.LocalObjectReference",
+		"io.k8s.kubernetes.pkg.api.v1.RBDVolumeSource":                                                     "io.k8s.api.core.v1.RBDVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicySpec":                                  "io.k8s.api.extensions.v1beta1.NetworkPolicySpec",
+		"io.k8s.kubernetes.pkg.api.v1.KeyToPath":                                                           "io.k8s.api.core.v1.KeyToPath",
+		"io.k8s.kubernetes.pkg.api.v1.WeightedPodAffinityTerm":                                             "io.k8s.api.core.v1.WeightedPodAffinityTerm",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.PodsMetricStatus":                                 "io.k8s.api.autoscaling.v2alpha1.PodsMetricStatus",
+		"io.k8s.kubernetes.pkg.api.v1.NodeAddress":                                                         "io.k8s.api.core.v1.NodeAddress",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.Ingress":                                            "io.k8s.api.extensions.v1beta1.Ingress",
+		"io.k8s.kubernetes.pkg.apis.policy.v1beta1.PodDisruptionBudget":                                    "io.k8s.api.policy.v1beta1.PodDisruptionBudget",
+		"io.k8s.kubernetes.pkg.api.v1.ServicePort":                                                         "io.k8s.api.core.v1.ServicePort",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IDRange":                                            "io.k8s.api.extensions.v1beta1.IDRange",
+		"io.k8s.kubernetes.pkg.api.v1.SecretEnvSource":                                                     "io.k8s.api.core.v1.SecretEnvSource",
+		"io.k8s.kubernetes.pkg.api.v1.NodeSelector":                                                        "io.k8s.api.core.v1.NodeSelector",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeClaimStatus":                                         "io.k8s.api.core.v1.PersistentVolumeClaimStatus",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentSpec":                                           "io.k8s.api.apps.v1beta1.DeploymentSpec",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.NonResourceAttributes":                                "io.k8s.api.authorization.v1.NonResourceAttributes",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.ScaleStatus":                                            "io.k8s.api.autoscaling.v1.ScaleStatus",
+		"io.k8s.kubernetes.pkg.api.v1.PodCondition":                                                        "io.k8s.api.core.v1.PodCondition",
+		"io.k8s.kubernetes.pkg.api.v1.PodTemplateSpec":                                                     "io.k8s.api.core.v1.PodTemplateSpec",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.StatefulSet":                                              "io.k8s.api.apps.v1beta1.StatefulSet",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicyPort":                                  "io.k8s.api.extensions.v1beta1.NetworkPolicyPort",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1beta1.TokenReview":                                    "io.k8s.api.authentication.v1beta1.TokenReview",
+		"io.k8s.kubernetes.pkg.api.v1.LimitRangeSpec":                                                      "io.k8s.api.core.v1.LimitRangeSpec",
+		"io.k8s.kubernetes.pkg.api.v1.FlockerVolumeSource":                                                 "io.k8s.api.core.v1.FlockerVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.policy.v1beta1.Eviction":                                               "io.k8s.api.policy.v1beta1.Eviction",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeClaimList":                                           "io.k8s.api.core.v1.PersistentVolumeClaimList",
+		"io.k8s.kubernetes.pkg.apis.certificates.v1beta1.CertificateSigningRequestCondition":               "io.k8s.api.certificates.v1beta1.CertificateSigningRequestCondition",
+		"io.k8s.kubernetes.pkg.api.v1.DownwardAPIVolumeFile":                                               "io.k8s.api.core.v1.DownwardAPIVolumeFile",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.LocalSubjectAccessReview":                        "io.k8s.api.authorization.v1beta1.LocalSubjectAccessReview",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.ScaleStatus":                                              "io.k8s.api.apps.v1beta1.ScaleStatus",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.HTTPIngressRuleValue":                               "io.k8s.api.extensions.v1beta1.HTTPIngressRuleValue",
+		"io.k8s.kubernetes.pkg.apis.batch.v1.Job":                                                          "io.k8s.api.batch.v1.Job",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.ExternalAdmissionHookConfiguration":     "io.k8s.api.admissionregistration.v1alpha1.ExternalAdmissionHookConfiguration",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.RoleBinding":                                              "io.k8s.api.rbac.v1beta1.RoleBinding",
+		"io.k8s.kubernetes.pkg.api.v1.FCVolumeSource":                                                      "io.k8s.api.core.v1.FCVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.EndpointAddress":                                                     "io.k8s.api.core.v1.EndpointAddress",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerPort":                                                       "io.k8s.api.core.v1.ContainerPort",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.ClusterRoleBinding":                                       "io.k8s.api.rbac.v1beta1.ClusterRoleBinding",
+		"io.k8s.kubernetes.pkg.api.v1.GlusterfsVolumeSource":                                               "io.k8s.api.core.v1.GlusterfsVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceRequirements":                                                "io.k8s.api.core.v1.ResourceRequirements",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.RollingUpdateDeployment":                                  "io.k8s.api.apps.v1beta1.RollingUpdateDeployment",
+		"io.k8s.kubernetes.pkg.api.v1.NamespaceStatus":                                                     "io.k8s.api.core.v1.NamespaceStatus",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.RunAsUserStrategyOptions":                           "io.k8s.api.extensions.v1beta1.RunAsUserStrategyOptions",
+		"io.k8s.kubernetes.pkg.api.v1.Namespace":                                                           "io.k8s.api.core.v1.Namespace",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.SubjectAccessReviewSpec":                              "io.k8s.api.authorization.v1.SubjectAccessReviewSpec",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.HorizontalPodAutoscaler":                          "io.k8s.api.autoscaling.v2alpha1.HorizontalPodAutoscaler",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ReplicaSetCondition":                                "io.k8s.api.extensions.v1beta1.ReplicaSetCondition",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.HorizontalPodAutoscalerStatus":                          "io.k8s.api.autoscaling.v1.HorizontalPodAutoscalerStatus",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1.TokenReviewStatus":                                   "io.k8s.api.authentication.v1.TokenReviewStatus",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolume":                                                    "io.k8s.api.core.v1.PersistentVolume",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.FSGroupStrategyOptions":                             "io.k8s.api.extensions.v1beta1.FSGroupStrategyOptions",
+		"io.k8s.kubernetes.pkg.api.v1.PodSecurityContext":                                                  "io.k8s.api.core.v1.PodSecurityContext",
+		"io.k8s.kubernetes.pkg.api.v1.PodTemplate":                                                         "io.k8s.api.core.v1.PodTemplate",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.LocalSubjectAccessReview":                             "io.k8s.api.authorization.v1.LocalSubjectAccessReview",
+		"io.k8s.kubernetes.pkg.api.v1.StorageOSVolumeSource":                                               "io.k8s.api.core.v1.StorageOSVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.NodeSelectorTerm":                                                    "io.k8s.api.core.v1.NodeSelectorTerm",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.Role":                                                     "io.k8s.api.rbac.v1beta1.Role",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerStatus":                                                     "io.k8s.api.core.v1.ContainerStatus",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.SubjectAccessReviewStatus":                            "io.k8s.api.authorization.v1.SubjectAccessReviewStatus",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1.TokenReviewSpec":                                     "io.k8s.api.authentication.v1.TokenReviewSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMap":                                                           "io.k8s.api.core.v1.ConfigMap",
+		"io.k8s.kubernetes.pkg.api.v1.ServiceStatus":                                                       "io.k8s.api.core.v1.ServiceStatus",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.SelfSubjectAccessReviewSpec":                     "io.k8s.api.authorization.v1beta1.SelfSubjectAccessReviewSpec",
+		"io.k8s.kubernetes.pkg.api.v1.CinderVolumeSource":                                                  "io.k8s.api.core.v1.CinderVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.settings.v1alpha1.PodPresetSpec":                                       "io.k8s.api.settings.v1alpha1.PodPresetSpec",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.NonResourceAttributes":                           "io.k8s.api.authorization.v1beta1.NonResourceAttributes",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerImage":                                                      "io.k8s.api.core.v1.ContainerImage",
+		"io.k8s.kubernetes.pkg.api.v1.ReplicationControllerCondition":                                      "io.k8s.api.core.v1.ReplicationControllerCondition",
+		"io.k8s.kubernetes.pkg.api.v1.EmptyDirVolumeSource":                                                "io.k8s.api.core.v1.EmptyDirVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.HorizontalPodAutoscalerList":                            "io.k8s.api.autoscaling.v1.HorizontalPodAutoscalerList",
+		"io.k8s.kubernetes.pkg.apis.batch.v1.JobList":                                                      "io.k8s.api.batch.v1.JobList",
+		"io.k8s.kubernetes.pkg.api.v1.NFSVolumeSource":                                                     "io.k8s.api.core.v1.NFSVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.Pod":                                                                 "io.k8s.api.core.v1.Pod",
+		"io.k8s.kubernetes.pkg.api.v1.ObjectReference":                                                     "io.k8s.api.core.v1.ObjectReference",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.Deployment":                                               "io.k8s.api.apps.v1beta1.Deployment",
+		"io.k8s.kubernetes.pkg.apis.storage.v1.StorageClassList":                                           "io.k8s.api.storage.v1.StorageClassList",
+		"io.k8s.kubernetes.pkg.api.v1.AttachedVolume":                                                      "io.k8s.api.core.v1.AttachedVolume",
+		"io.k8s.kubernetes.pkg.api.v1.AWSElasticBlockStoreVolumeSource":                                    "io.k8s.api.core.v1.AWSElasticBlockStoreVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.batch.v2alpha1.CronJobList":                                            "io.k8s.api.batch.v2alpha1.CronJobList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentSpec":                                     "io.k8s.api.extensions.v1beta1.DeploymentSpec",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.PodSecurityPolicyList":                              "io.k8s.api.extensions.v1beta1.PodSecurityPolicyList",
+		"io.k8s.kubernetes.pkg.api.v1.PodAffinityTerm":                                                     "io.k8s.api.core.v1.PodAffinityTerm",
+		"io.k8s.kubernetes.pkg.api.v1.HTTPHeader":                                                          "io.k8s.api.core.v1.HTTPHeader",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMapKeySelector":                                                "io.k8s.api.core.v1.ConfigMapKeySelector",
+		"io.k8s.kubernetes.pkg.api.v1.SecretKeySelector":                                                   "io.k8s.api.core.v1.SecretKeySelector",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentList":                                     "io.k8s.api.extensions.v1beta1.DeploymentList",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1.UserInfo":                                            "io.k8s.api.authentication.v1.UserInfo",
+		"io.k8s.kubernetes.pkg.api.v1.LoadBalancerIngress":                                                 "io.k8s.api.core.v1.LoadBalancerIngress",
+		"io.k8s.kubernetes.pkg.api.v1.DaemonEndpoint":                                                      "io.k8s.api.core.v1.DaemonEndpoint",
+		"io.k8s.kubernetes.pkg.api.v1.NodeSelectorRequirement":                                             "io.k8s.api.core.v1.NodeSelectorRequirement",
+		"io.k8s.kubernetes.pkg.apis.batch.v2alpha1.CronJobStatus":                                          "io.k8s.api.batch.v2alpha1.CronJobStatus",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.Scale":                                                  "io.k8s.api.autoscaling.v1.Scale",
+		"io.k8s.kubernetes.pkg.api.v1.ScaleIOVolumeSource":                                                 "io.k8s.api.core.v1.ScaleIOVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.PodAntiAffinity":                                                     "io.k8s.api.core.v1.PodAntiAffinity",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.PodSecurityPolicySpec":                              "io.k8s.api.extensions.v1beta1.PodSecurityPolicySpec",
+		"io.k8s.kubernetes.pkg.apis.settings.v1alpha1.PodPresetList":                                       "io.k8s.api.settings.v1alpha1.PodPresetList",
+		"io.k8s.kubernetes.pkg.api.v1.NodeAffinity":                                                        "io.k8s.api.core.v1.NodeAffinity",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentCondition":                                      "io.k8s.api.apps.v1beta1.DeploymentCondition",
+		"io.k8s.kubernetes.pkg.api.v1.NodeSpec":                                                            "io.k8s.api.core.v1.NodeSpec",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.StatefulSetStatus":                                        "io.k8s.api.apps.v1beta1.StatefulSetStatus",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.RuleWithOperations":                     "io.k8s.api.admissionregistration.v1alpha1.RuleWithOperations",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressStatus":                                      "io.k8s.api.extensions.v1beta1.IngressStatus",
+		"io.k8s.kubernetes.pkg.api.v1.LimitRangeList":                                                      "io.k8s.api.core.v1.LimitRangeList",
+		"io.k8s.kubernetes.pkg.api.v1.AzureDiskVolumeSource":                                               "io.k8s.api.core.v1.AzureDiskVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ReplicaSetStatus":                                   "io.k8s.api.extensions.v1beta1.ReplicaSetStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ComponentStatus":                                                     "io.k8s.api.core.v1.ComponentStatus",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.HorizontalPodAutoscaler":                                "io.k8s.api.autoscaling.v1.HorizontalPodAutoscaler",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicy":                                           "io.k8s.api.networking.v1.NetworkPolicy",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.RollbackConfig":                                           "io.k8s.api.apps.v1beta1.RollbackConfig",
+		"io.k8s.kubernetes.pkg.api.v1.NodeCondition":                                                       "io.k8s.api.core.v1.NodeCondition",
+		"io.k8s.kubernetes.pkg.api.v1.DownwardAPIProjection":                                               "io.k8s.api.core.v1.DownwardAPIProjection",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.SELinuxStrategyOptions":                             "io.k8s.api.extensions.v1beta1.SELinuxStrategyOptions",
+		"io.k8s.kubernetes.pkg.api.v1.NamespaceSpec":                                                       "io.k8s.api.core.v1.NamespaceSpec",
+		"io.k8s.kubernetes.pkg.apis.certificates.v1beta1.CertificateSigningRequestSpec":                    "io.k8s.api.certificates.v1beta1.CertificateSigningRequestSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ServiceSpec":                                                         "io.k8s.api.core.v1.ServiceSpec",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1.SubjectAccessReview":                                  "io.k8s.api.authorization.v1.SubjectAccessReview",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentList":                                           "io.k8s.api.apps.v1beta1.DeploymentList",
+		"io.k8s.kubernetes.pkg.api.v1.Toleration":                                                          "io.k8s.api.core.v1.Toleration",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.NetworkPolicyList":                                  "io.k8s.api.extensions.v1beta1.NetworkPolicyList",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.PodsMetricSource":                                 "io.k8s.api.autoscaling.v2alpha1.PodsMetricSource",
+		"io.k8s.kubernetes.pkg.api.v1.EnvFromSource":                                                       "io.k8s.api.core.v1.EnvFromSource",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v1.ScaleSpec":                                              "io.k8s.api.autoscaling.v1.ScaleSpec",
+		"io.k8s.kubernetes.pkg.api.v1.PodTemplateList":                                                     "io.k8s.api.core.v1.PodTemplateList",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.HorizontalPodAutoscalerSpec":                      "io.k8s.api.autoscaling.v2alpha1.HorizontalPodAutoscalerSpec",
+		"io.k8s.kubernetes.pkg.api.v1.SecretProjection":                                                    "io.k8s.api.core.v1.SecretProjection",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceFieldSelector":                                               "io.k8s.api.core.v1.ResourceFieldSelector",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeSpec":                                                "io.k8s.api.core.v1.PersistentVolumeSpec",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMapVolumeSource":                                               "io.k8s.api.core.v1.ConfigMapVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.autoscaling.v2alpha1.HorizontalPodAutoscalerList":                      "io.k8s.api.autoscaling.v2alpha1.HorizontalPodAutoscalerList",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1beta1.TokenReviewStatus":                              "io.k8s.api.authentication.v1beta1.TokenReviewStatus",
+		"io.k8s.kubernetes.pkg.apis.networking.v1.NetworkPolicyList":                                       "io.k8s.api.networking.v1.NetworkPolicyList",
+		"io.k8s.kubernetes.pkg.api.v1.Endpoints":                                                           "io.k8s.api.core.v1.Endpoints",
+		"io.k8s.kubernetes.pkg.api.v1.LimitRangeItem":                                                      "io.k8s.api.core.v1.LimitRangeItem",
+		"io.k8s.kubernetes.pkg.api.v1.ServiceAccount":                                                      "io.k8s.api.core.v1.ServiceAccount",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ScaleSpec":                                          "io.k8s.api.extensions.v1beta1.ScaleSpec",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.IngressTLS":                                         "io.k8s.api.extensions.v1beta1.IngressTLS",
+		"io.k8s.kubernetes.pkg.apis.batch.v2alpha1.CronJob":                                                "io.k8s.api.batch.v2alpha1.CronJob",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.Subject":                                                 "io.k8s.api.rbac.v1alpha1.Subject",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DaemonSetStatus":                                    "io.k8s.api.extensions.v1beta1.DaemonSetStatus",
+		"io.k8s.kubernetes.pkg.apis.policy.v1beta1.PodDisruptionBudgetList":                                "io.k8s.api.policy.v1beta1.PodDisruptionBudgetList",
+		"io.k8s.kubernetes.pkg.api.v1.VsphereVirtualDiskVolumeSource":                                      "io.k8s.api.core.v1.VsphereVirtualDiskVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.RoleRef":                                                 "io.k8s.api.rbac.v1alpha1.RoleRef",
+		"io.k8s.kubernetes.pkg.api.v1.PortworxVolumeSource":                                                "io.k8s.api.core.v1.PortworxVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ReplicaSetList":                                     "io.k8s.api.extensions.v1beta1.ReplicaSetList",
+		"io.k8s.kubernetes.pkg.api.v1.VolumeProjection":                                                    "io.k8s.api.core.v1.VolumeProjection",
+		"io.k8s.kubernetes.pkg.apis.storage.v1beta1.StorageClass":                                          "io.k8s.api.storage.v1beta1.StorageClass",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.ReplicaSet":                                         "io.k8s.api.extensions.v1beta1.ReplicaSet",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.DeploymentRollback":                                       "io.k8s.api.apps.v1beta1.DeploymentRollback",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1alpha1.RoleBinding":                                             "io.k8s.api.rbac.v1alpha1.RoleBinding",
+		"io.k8s.kubernetes.pkg.api.v1.AzureFileVolumeSource":                                               "io.k8s.api.core.v1.AzureFileVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.policy.v1beta1.PodDisruptionBudgetStatus":                              "io.k8s.api.policy.v1beta1.PodDisruptionBudgetStatus",
+		"io.k8s.kubernetes.pkg.apis.authentication.v1beta1.TokenReviewSpec":                                "io.k8s.api.authentication.v1beta1.TokenReviewSpec",
+		"io.k8s.kubernetes.pkg.api.v1.EndpointsList":                                                       "io.k8s.api.core.v1.EndpointsList",
+		"io.k8s.kubernetes.pkg.api.v1.ConfigMapEnvSource":                                                  "io.k8s.api.core.v1.ConfigMapEnvSource",
+		"io.k8s.kubernetes.pkg.apis.batch.v2alpha1.JobTemplateSpec":                                        "io.k8s.api.batch.v2alpha1.JobTemplateSpec",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DaemonSetUpdateStrategy":                            "io.k8s.api.extensions.v1beta1.DaemonSetUpdateStrategy",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.SubjectAccessReviewSpec":                         "io.k8s.api.authorization.v1beta1.SubjectAccessReviewSpec",
+		"io.k8s.kubernetes.pkg.api.v1.LocalVolumeSource":                                                   "io.k8s.api.core.v1.LocalVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.ContainerState":                                                      "io.k8s.api.core.v1.ContainerState",
+		"io.k8s.kubernetes.pkg.api.v1.Service":                                                             "io.k8s.api.core.v1.Service",
+		"io.k8s.kubernetes.pkg.api.v1.ExecAction":                                                          "io.k8s.api.core.v1.ExecAction",
+		"io.k8s.kubernetes.pkg.api.v1.Taint":                                                               "io.k8s.api.core.v1.Taint",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.Subject":                                                  "io.k8s.api.rbac.v1beta1.Subject",
+		"io.k8s.kubernetes.pkg.apis.authorization.v1beta1.SubjectAccessReviewStatus":                       "io.k8s.api.authorization.v1beta1.SubjectAccessReviewStatus",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.ClusterRoleBindingList":                                   "io.k8s.api.rbac.v1beta1.ClusterRoleBindingList",
+		"io.k8s.kubernetes.pkg.api.v1.DownwardAPIVolumeSource":                                             "io.k8s.api.core.v1.DownwardAPIVolumeSource",
+		"io.k8s.kubernetes.pkg.apis.batch.v1.JobStatus":                                                    "io.k8s.api.batch.v1.JobStatus",
+		"io.k8s.kubernetes.pkg.api.v1.ResourceQuotaStatus":                                                 "io.k8s.api.core.v1.ResourceQuotaStatus",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeStatus":                                              "io.k8s.api.core.v1.PersistentVolumeStatus",
+		"io.k8s.kubernetes.pkg.api.v1.PersistentVolumeClaim":                                               "io.k8s.api.core.v1.PersistentVolumeClaim",
+		"io.k8s.kubernetes.pkg.api.v1.NodeDaemonEndpoints":                                                 "io.k8s.api.core.v1.NodeDaemonEndpoints",
+		"io.k8s.kubernetes.pkg.api.v1.EnvVar":                                                              "io.k8s.api.core.v1.EnvVar",
+		"io.k8s.kubernetes.pkg.api.v1.SecretVolumeSource":                                                  "io.k8s.api.core.v1.SecretVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.EnvVarSource":                                                        "io.k8s.api.core.v1.EnvVarSource",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.RollingUpdateStatefulSetStrategy":                         "io.k8s.api.apps.v1beta1.RollingUpdateStatefulSetStrategy",
+		"io.k8s.kubernetes.pkg.apis.rbac.v1beta1.ClusterRole":                                              "io.k8s.api.rbac.v1beta1.ClusterRole",
+		"io.k8s.kubernetes.pkg.apis.admissionregistration.v1alpha1.Initializer":                            "io.k8s.api.admissionregistration.v1alpha1.Initializer",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.DeploymentStrategy":                                 "io.k8s.api.extensions.v1beta1.DeploymentStrategy",
+		"io.k8s.kubernetes.pkg.apis.apps.v1beta1.ScaleSpec":                                                "io.k8s.api.apps.v1beta1.ScaleSpec",
+		"io.k8s.kubernetes.pkg.apis.settings.v1alpha1.PodPreset":                                           "io.k8s.api.settings.v1alpha1.PodPreset",
+		"io.k8s.kubernetes.pkg.api.v1.Probe":                                                               "io.k8s.api.core.v1.Probe",
+		"io.k8s.kubernetes.pkg.api.v1.NamespaceList":                                                       "io.k8s.api.core.v1.NamespaceList",
+		"io.k8s.kubernetes.pkg.api.v1.QuobyteVolumeSource":                                                 "io.k8s.api.core.v1.QuobyteVolumeSource",
+		"io.k8s.kubernetes.pkg.api.v1.NodeList":                                                            "io.k8s.api.core.v1.NodeList",
+		"io.k8s.kubernetes.pkg.apis.extensions.v1beta1.RollingUpdateDaemonSet":                             "io.k8s.api.extensions.v1beta1.RollingUpdateDaemonSet",
+		"io.k8s.kubernetes.pkg.api.v1.LimitRange":                                                          "io.k8s.api.core.v1.LimitRange",
 	}
 
-	// "api/legacy=false" allows users to disable legacy api versions.
-	disableLegacyAPIs := false
-	legacyAPIFlagValue, ok := s.RuntimeConfig["api/legacy"]
-	if ok && legacyAPIFlagValue == "false" {
-		disableLegacyAPIs = true
-	}
-	_ = disableLegacyAPIs // hush the compiler while we don't have legacy APIs to disable.
-
-	// "api/v1={true|false} allows users to enable/disable v1 API.
-	// This takes preference over api/all and api/legacy, if specified.
-	disableV1 := disableAllAPIs
-	v1GroupVersion := "api/v1"
-	disableV1 = !getRuntimeConfigValue(s, v1GroupVersion, !disableV1)
-	apiGroupVersionOverrides := map[string]genericapiserver.APIGroupVersionOverride{}
-	if disableV1 {
-		apiGroupVersionOverrides[v1GroupVersion] = genericapiserver.APIGroupVersionOverride{
-			Disable: true,
+	for k, v := range compatibilityMap {
+		if _, found := s.Definitions[v]; !found {
+			continue
+		}
+		s.Definitions[k] = spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Ref:         spec.MustCreateRef("#/definitions/" + openapi.EscapeJsonPointer(v)),
+				Description: fmt.Sprintf("Deprecated. Please use %s instead.", v),
+			},
 		}
 	}
-
-	// "extensions/v1beta1={true|false} allows users to enable/disable the extensions API.
-	// This takes preference over api/all, if specified.
-	disableExtensions := disableAllAPIs
-	extensionsGroupVersion := "extensions/v1beta1"
-	// TODO: Make this a loop over all group/versions when there are more of them.
-	disableExtensions = !getRuntimeConfigValue(s, extensionsGroupVersion, !disableExtensions)
-	if disableExtensions {
-		apiGroupVersionOverrides[extensionsGroupVersion] = genericapiserver.APIGroupVersionOverride{
-			Disable: true,
-		}
-	}
-
-	disableAutoscaling := disableAllAPIs
-	autoscalingGroupVersion := "autoscaling/v1"
-	disableAutoscaling = !getRuntimeConfigValue(s, autoscalingGroupVersion, !disableAutoscaling)
-	if disableAutoscaling {
-		apiGroupVersionOverrides[autoscalingGroupVersion] = genericapiserver.APIGroupVersionOverride{
-			Disable: true,
-		}
-	}
-	disableBatch := disableAllAPIs
-	batchGroupVersion := "batch/v1"
-	disableBatch = !getRuntimeConfigValue(s, batchGroupVersion, !disableBatch)
-	if disableBatch {
-		apiGroupVersionOverrides[batchGroupVersion] = genericapiserver.APIGroupVersionOverride{
-			Disable: true,
-		}
-	}
-
-	for key := range s.RuntimeConfig {
-		if strings.HasPrefix(key, v1GroupVersion+"/") {
-			return nil, fmt.Errorf("api/v1 resources cannot be enabled/disabled individually")
-		} else if strings.HasPrefix(key, extensionsGroupVersion+"/") {
-			resource := strings.TrimPrefix(key, extensionsGroupVersion+"/")
-
-			apiGroupVersionOverride := apiGroupVersionOverrides[extensionsGroupVersion]
-			if apiGroupVersionOverride.ResourceOverrides == nil {
-				apiGroupVersionOverride.ResourceOverrides = map[string]bool{}
-			}
-			apiGroupVersionOverride.ResourceOverrides[resource] = getRuntimeConfigValue(s, key, false)
-			apiGroupVersionOverrides[extensionsGroupVersion] = apiGroupVersionOverride
-		}
-	}
-	return apiGroupVersionOverrides, nil
+	return s, nil
 }

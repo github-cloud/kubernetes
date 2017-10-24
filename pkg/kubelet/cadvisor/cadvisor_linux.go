@@ -1,7 +1,7 @@
 // +build cgo,linux
 
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,24 +21,30 @@ package cadvisor
 import (
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
-	"regexp"
+	"os"
+	"path"
+	"strconv"
 	"time"
 
 	"github.com/golang/glog"
 	"github.com/google/cadvisor/cache/memory"
-	cadvisorMetrics "github.com/google/cadvisor/container"
+	cadvisormetrics "github.com/google/cadvisor/container"
 	"github.com/google/cadvisor/events"
-	cadvisorfs "github.com/google/cadvisor/fs"
 	cadvisorhttp "github.com/google/cadvisor/http"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
 	"github.com/google/cadvisor/manager"
+	"github.com/google/cadvisor/metrics"
 	"github.com/google/cadvisor/utils/sysfs"
-	"k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 type cadvisorClient struct {
+	imageFsInfoProvider ImageFsInfoProvider
+	rootPath            string
 	manager.Manager
 }
 
@@ -52,31 +58,79 @@ const defaultHousekeepingInterval = 10 * time.Second
 const allowDynamicHousekeeping = true
 
 func init() {
-	// Override the default cAdvisor housekeeping interval.
-	if f := flag.Lookup("housekeeping_interval"); f != nil {
-		f.DefValue = defaultHousekeepingInterval.String()
-		f.Value.Set(f.DefValue)
+	// Override cAdvisor flag defaults.
+	flagOverrides := map[string]string{
+		// Override the default cAdvisor housekeeping interval.
+		"housekeeping_interval": defaultHousekeepingInterval.String(),
+		// Disable event storage by default.
+		"event_storage_event_limit": "default=0",
+		"event_storage_age_limit":   "default=0",
+	}
+	for name, defaultValue := range flagOverrides {
+		if f := flag.Lookup(name); f != nil {
+			f.DefValue = defaultValue
+			f.Value.Set(defaultValue)
+		} else {
+			glog.Errorf("Expected cAdvisor flag %q not found", name)
+		}
 	}
 }
 
-// Creates a cAdvisor and exports its API on the specified port if port > 0.
-func New(port uint) (Interface, error) {
-	sysFs, err := sysfs.NewRealSysFs()
+func containerLabels(c *cadvisorapi.ContainerInfo) map[string]string {
+	// Prometheus requires that all metrics in the same family have the same labels,
+	// so we arrange to supply blank strings for missing labels
+	var name, image, podName, namespace, containerName string
+	if len(c.Aliases) > 0 {
+		name = c.Aliases[0]
+	}
+	image = c.Spec.Image
+	if v, ok := c.Spec.Labels[types.KubernetesPodNameLabel]; ok {
+		podName = v
+	}
+	if v, ok := c.Spec.Labels[types.KubernetesPodNamespaceLabel]; ok {
+		namespace = v
+	}
+	if v, ok := c.Spec.Labels[types.KubernetesContainerNameLabel]; ok {
+		containerName = v
+	}
+	set := map[string]string{
+		metrics.LabelID:    c.Name,
+		metrics.LabelName:  name,
+		metrics.LabelImage: image,
+		"pod_name":         podName,
+		"namespace":        namespace,
+		"container_name":   containerName,
+	}
+	return set
+}
+
+// New creates a cAdvisor and exports its API on the specified port if port > 0.
+func New(address string, port uint, imageFsInfoProvider ImageFsInfoProvider, rootPath string) (Interface, error) {
+	sysFs := sysfs.NewRealSysFs()
+
+	// Create and start the cAdvisor container manager.
+	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, maxHousekeepingInterval, allowDynamicHousekeeping, cadvisormetrics.MetricSet{cadvisormetrics.NetworkTcpUsageMetrics: struct{}{}, cadvisormetrics.NetworkUdpUsageMetrics: struct{}{}}, http.DefaultClient)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create and start the cAdvisor container manager.
-	m, err := manager.New(memory.New(statsCacheDuration, nil), sysFs, maxHousekeepingInterval, allowDynamicHousekeeping, cadvisorMetrics.MetricSet{cadvisorMetrics.NetworkTcpUsageMetrics: struct{}{}})
-	if err != nil {
-		return nil, err
+	if _, err := os.Stat(rootPath); err != nil {
+		if os.IsNotExist(err) {
+			if err := os.MkdirAll(path.Clean(rootPath), 0750); err != nil {
+				return nil, fmt.Errorf("error creating root directory %q: %v", rootPath, err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to Stat %q: %v", rootPath, err)
+		}
 	}
 
 	cadvisorClient := &cadvisorClient{
-		Manager: m,
+		imageFsInfoProvider: imageFsInfoProvider,
+		rootPath:            rootPath,
+		Manager:             m,
 	}
 
-	err = cadvisorClient.exportHTTP(port)
+	err = cadvisorClient.exportHTTP(address, port)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +141,7 @@ func (cc *cadvisorClient) Start() error {
 	return cc.Manager.Start()
 }
 
-func (cc *cadvisorClient) exportHTTP(port uint) error {
+func (cc *cadvisorClient) exportHTTP(address string, port uint) error {
 	// Register the handlers regardless as this registers the prometheus
 	// collector properly.
 	mux := http.NewServeMux()
@@ -96,23 +150,12 @@ func (cc *cadvisorClient) exportHTTP(port uint) error {
 		return err
 	}
 
-	re := regexp.MustCompile(`^k8s_(?P<kubernetes_container_name>[^_\.]+)[^_]+_(?P<kubernetes_pod_name>[^_]+)_(?P<kubernetes_namespace>[^_]+)`)
-	reCaptureNames := re.SubexpNames()
-	cadvisorhttp.RegisterPrometheusHandler(mux, cc, "/metrics", func(name string) map[string]string {
-		extraLabels := map[string]string{}
-		matches := re.FindStringSubmatch(name)
-		for i, match := range matches {
-			if len(reCaptureNames[i]) > 0 {
-				extraLabels[re.SubexpNames()[i]] = match
-			}
-		}
-		return extraLabels
-	})
+	cadvisorhttp.RegisterPrometheusHandler(mux, cc, "/metrics", containerLabels)
 
 	// Only start the http server if port > 0
 	if port > 0 {
 		serv := &http.Server{
-			Addr:    fmt.Sprintf(":%d", port),
+			Addr:    net.JoinHostPort(address, strconv.Itoa(int(port))),
 			Handler: mux,
 		}
 
@@ -148,7 +191,7 @@ func (cc *cadvisorClient) VersionInfo() (*cadvisorapi.VersionInfo, error) {
 
 func (cc *cadvisorClient) SubcontainerInfo(name string, req *cadvisorapi.ContainerInfoRequest) (map[string]*cadvisorapi.ContainerInfo, error) {
 	infos, err := cc.SubcontainersInfo(name, req)
-	if err != nil {
+	if err != nil && len(infos) == 0 {
 		return nil, err
 	}
 
@@ -156,19 +199,23 @@ func (cc *cadvisorClient) SubcontainerInfo(name string, req *cadvisorapi.Contain
 	for _, info := range infos {
 		result[info.Name] = info
 	}
-	return result, nil
+	return result, err
 }
 
 func (cc *cadvisorClient) MachineInfo() (*cadvisorapi.MachineInfo, error) {
 	return cc.GetMachineInfo()
 }
 
-func (cc *cadvisorClient) DockerImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
-	return cc.getFsInfo(cadvisorfs.LabelDockerImages)
+func (cc *cadvisorClient) ImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
+	label, err := cc.imageFsInfoProvider.ImageFsInfoLabel()
+	if err != nil {
+		return cadvisorapiv2.FsInfo{}, err
+	}
+	return cc.getFsInfo(label)
 }
 
 func (cc *cadvisorClient) RootFsInfo() (cadvisorapiv2.FsInfo, error) {
-	return cc.getFsInfo(cadvisorfs.LabelSystemRoot)
+	return cc.GetDirFsInfo(cc.rootPath)
 }
 
 func (cc *cadvisorClient) getFsInfo(label string) (cadvisorapiv2.FsInfo, error) {
@@ -189,4 +236,17 @@ func (cc *cadvisorClient) getFsInfo(label string) (cadvisorapiv2.FsInfo, error) 
 
 func (cc *cadvisorClient) WatchEvents(request *events.Request) (*events.EventChannel, error) {
 	return cc.WatchForEvents(request)
+}
+
+// HasDedicatedImageFs returns true if the imagefs has a dedicated device.
+func (cc *cadvisorClient) HasDedicatedImageFs() (bool, error) {
+	imageFsInfo, err := cc.ImagesFsInfo()
+	if err != nil {
+		return false, err
+	}
+	rootFsInfo, err := cc.RootFsInfo()
+	if err != nil {
+		return false, err
+	}
+	return imageFsInfo.Device != rootFsInfo.Device, nil
 }

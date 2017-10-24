@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,30 +24,60 @@ import (
 	"path"
 	"time"
 
-	"github.com/emicklei/go-restful"
+	restful "github.com/emicklei/go-restful"
 	"github.com/golang/glog"
 	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/volume"
 )
 
 // Host methods required by stats handlers.
 type StatsProvider interface {
+	// The following stats are provided by either CRI or cAdvisor.
+	//
+	// ListPodStats returns the stats of all the containers managed by pods.
+	ListPodStats() ([]statsapi.PodStats, error)
+	// ImageFsStats returns the stats of the image filesystem.
+	ImageFsStats() (*statsapi.FsStats, error)
+
+	// The following stats are provided by cAdvisor.
+	//
+	// GetCgroupStats returns the stats and the networking usage of the cgroup
+	// with the specified cgroupName.
+	GetCgroupStats(cgroupName string) (*statsapi.ContainerStats, *statsapi.NetworkStats, error)
+	// RootFsStats returns the stats of the node root filesystem.
+	RootFsStats() (*statsapi.FsStats, error)
+
+	// The following stats are provided by cAdvisor for legacy usage.
+	//
+	// GetContainerInfo returns the information of the container with the
+	// containerName managed by the pod with the uid.
 	GetContainerInfo(podFullName string, uid types.UID, containerName string, req *cadvisorapi.ContainerInfoRequest) (*cadvisorapi.ContainerInfo, error)
-	GetContainerInfoV2(name string, options cadvisorapiv2.RequestOptions) (map[string]cadvisorapiv2.ContainerInfo, error)
+	// GetRawContainerInfo returns the information of the container with the
+	// containerName. If subcontainers is true, this function will return the
+	// information of all the sub-containers as well.
 	GetRawContainerInfo(containerName string, req *cadvisorapi.ContainerInfoRequest, subcontainers bool) (map[string]*cadvisorapi.ContainerInfo, error)
-	GetPodByName(namespace, name string) (*api.Pod, bool)
-	GetNode() (*api.Node, error)
+
+	// The following information is provided by Kubelet.
+	//
+	// GetPodByName returns the spec of the pod with the name in the specified
+	// namespace.
+	GetPodByName(namespace, name string) (*v1.Pod, bool)
+	// GetNode returns the spec of the local node.
+	GetNode() (*v1.Node, error)
+	// GetNodeConfig returns the configuration of the local node.
 	GetNodeConfig() cm.NodeConfig
-	DockerImagesFsInfo() (cadvisorapiv2.FsInfo, error)
-	RootFsInfo() (cadvisorapiv2.FsInfo, error)
+	// ListVolumesForPod returns the stats of the volume used by the pod with
+	// the podUID.
 	ListVolumesForPod(podUID types.UID) (map[string]volume.Volume, bool)
-	GetPods() []*api.Pod
+	// GetPods returns the specs of all the pods running on this node.
+	GetPods() []*v1.Pod
 }
 
 type handler struct {
@@ -55,11 +85,11 @@ type handler struct {
 	summaryProvider SummaryProvider
 }
 
-func CreateHandlers(provider StatsProvider, resourceAnalyzer ResourceAnalyzer) *restful.WebService {
-	h := &handler{provider, NewSummaryProvider(provider, resourceAnalyzer)}
+func CreateHandlers(rootPath string, provider StatsProvider, summaryProvider SummaryProvider) *restful.WebService {
+	h := &handler{provider, summaryProvider}
 
 	ws := &restful.WebService{}
-	ws.Path("/stats/").
+	ws.Path(rootPath).
 		Produces(restful.MIME_JSON)
 
 	endpoints := []struct {
@@ -88,23 +118,28 @@ func CreateHandlers(provider StatsProvider, resourceAnalyzer ResourceAnalyzer) *
 type StatsRequest struct {
 	// The name of the container for which to request stats.
 	// Default: /
+	// +optional
 	ContainerName string `json:"containerName,omitempty"`
 
 	// Max number of stats to return.
 	// If start and end time are specified this limit is ignored.
 	// Default: 60
+	// +optional
 	NumStats int `json:"num_stats,omitempty"`
 
 	// Start time for which to query information.
 	// If omitted, the beginning of time is assumed.
+	// +optional
 	Start time.Time `json:"start,omitempty"`
 
 	// End time for which to query information.
 	// If omitted, current time is assumed.
+	// +optional
 	End time.Time `json:"end,omitempty"`
 
 	// Whether to also include information from subcontainers.
 	// Default: false.
+	// +optional
 	Subcontainers bool `json:"subcontainers,omitempty"`
 }
 
@@ -133,14 +168,14 @@ func parseStatsRequest(request *restful.Request) (StatsRequest, error) {
 func (h *handler) handleStats(request *restful.Request, response *restful.Response) {
 	query, err := parseStatsRequest(request)
 	if err != nil {
-		handleError(response, err)
+		handleError(response, "/stats", err)
 		return
 	}
 
 	// Root container stats.
 	statsMap, err := h.provider.GetRawContainerInfo("/", query.cadvisorRequest(), false)
 	if err != nil {
-		handleError(response, err)
+		handleError(response, fmt.Sprintf("/stats %v", query), err)
 		return
 	}
 	writeResponse(response, statsMap["/"])
@@ -150,7 +185,7 @@ func (h *handler) handleStats(request *restful.Request, response *restful.Respon
 func (h *handler) handleSummary(request *restful.Request, response *restful.Response) {
 	summary, err := h.summaryProvider.Get()
 	if err != nil {
-		handleError(response, err)
+		handleError(response, "/stats/summary", err)
 	} else {
 		writeResponse(response, summary)
 	}
@@ -160,7 +195,7 @@ func (h *handler) handleSummary(request *restful.Request, response *restful.Resp
 func (h *handler) handleSystemContainer(request *restful.Request, response *restful.Response) {
 	query, err := parseStatsRequest(request)
 	if err != nil {
-		handleError(response, err)
+		handleError(response, "/stats/container", err)
 		return
 	}
 
@@ -169,8 +204,13 @@ func (h *handler) handleSystemContainer(request *restful.Request, response *rest
 	stats, err := h.provider.GetRawContainerInfo(
 		containerName, query.cadvisorRequest(), query.Subcontainers)
 	if err != nil {
-		handleError(response, err)
-		return
+		if _, ok := stats[containerName]; ok {
+			// If the failure is partial, log it and return a best-effort response.
+			glog.Errorf("Partial failure issuing GetRawContainerInfo(%v): %v", query, err)
+		} else {
+			handleError(response, fmt.Sprintf("/stats/container %v", query), err)
+			return
+		}
 	}
 	writeResponse(response, stats)
 }
@@ -181,13 +221,13 @@ func (h *handler) handleSystemContainer(request *restful.Request, response *rest
 func (h *handler) handlePodContainer(request *restful.Request, response *restful.Response) {
 	query, err := parseStatsRequest(request)
 	if err != nil {
-		handleError(response, err)
+		handleError(response, request.Request.URL.String(), err)
 		return
 	}
 
 	// Default parameters.
 	params := map[string]string{
-		"namespace": api.NamespaceDefault,
+		"namespace": metav1.NamespaceDefault,
 		"uid":       "",
 	}
 	for k, v := range request.PathParameters() {
@@ -203,7 +243,7 @@ func (h *handler) handlePodContainer(request *restful.Request, response *restful
 	pod, ok := h.provider.GetPodByName(params["namespace"], params["podName"])
 	if !ok {
 		glog.V(4).Infof("Container not found: %v", params)
-		handleError(response, kubecontainer.ErrContainerNotFound)
+		response.WriteError(http.StatusNotFound, kubecontainer.ErrContainerNotFound)
 		return
 	}
 	stats, err := h.provider.GetContainerInfo(
@@ -213,7 +253,7 @@ func (h *handler) handlePodContainer(request *restful.Request, response *restful
 		query.cadvisorRequest())
 
 	if err != nil {
-		handleError(response, err)
+		handleError(response, fmt.Sprintf("%s %v", request.Request.URL.String(), query), err)
 		return
 	}
 	writeResponse(response, stats)
@@ -226,13 +266,14 @@ func writeResponse(response *restful.Response, stats interface{}) {
 }
 
 // handleError serializes an error object into an HTTP response.
-func handleError(response *restful.Response, err error) {
+// request is provided for logging.
+func handleError(response *restful.Response, request string, err error) {
 	switch err {
 	case kubecontainer.ErrContainerNotFound:
 		response.WriteError(http.StatusNotFound, err)
 	default:
 		msg := fmt.Sprintf("Internal Error: %v", err)
-		glog.Errorf("HTTP InternalServerError: %s", msg)
+		glog.Errorf("HTTP InternalServerError serving %s: %s", request, msg)
 		response.WriteErrorString(http.StatusInternalServerError, msg)
 	}
 }

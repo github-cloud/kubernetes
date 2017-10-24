@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,12 +33,25 @@ type Interface interface {
 
 	VersionInfo() (*cadvisorapi.VersionInfo, error)
 
-	// Returns usage information about the filesystem holding Docker images.
-	DockerImagesFsInfo() (cadvisorapiv2.FsInfo, error)
+	// Returns usage information about the filesystem holding container images.
+	ImagesFsInfo() (cadvisorapiv2.FsInfo, error)
 
 	// Returns usage information about the root filesystem.
 	RootFsInfo() (cadvisorapiv2.FsInfo, error)
 
 	// Get events streamed through passedChannel that fit the request.
 	WatchEvents(request *events.Request) (*events.EventChannel, error)
+
+	// HasDedicatedImageFs returns true iff a dedicated image filesystem exists for storing images.
+	HasDedicatedImageFs() (bool, error)
+
+	// GetFsInfoByFsUUID returns the stats of the filesystem with the specified
+	// uuid.
+	GetFsInfoByFsUUID(uuid string) (cadvisorapiv2.FsInfo, error)
+}
+
+// ImageFsInfoProvider informs cAdvisor how to find imagefs for container images.
+type ImageFsInfoProvider interface {
+	// ImageFsInfoLabel returns the label cAdvisor should use to find the filesystem holding container images.
+	ImageFsInfoLabel() (string, error)
 }

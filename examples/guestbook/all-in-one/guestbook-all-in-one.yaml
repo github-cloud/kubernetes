@@ -8,7 +8,6 @@ metadata:
     role: master
 spec:
   ports:
-    # the port that this service should serve on
   - port: 6379
     targetPort: 6379
   selector:
@@ -16,26 +15,12 @@ spec:
     tier: backend
     role: master
 ---
-apiVersion: v1
-kind: ReplicationController
+apiVersion: extensions/v1beta1
+kind: Deployment
 metadata:
   name: redis-master
-  # these labels can be applied automatically 
-  # from the labels in the pod template if not set
-  labels:
-    app: redis
-    role: master
-    tier: backend
 spec:
-  # this replicas value is default
-  # modify it according to your case
   replicas: 1
-  # selector can be applied automatically 
-  # from the labels in the pod template if not set
-  # selector:
-  #   app: guestbook
-  #   role: master
-  #   tier: backend
   template:
     metadata:
       labels:
@@ -63,33 +48,18 @@ metadata:
     role: slave
 spec:
   ports:
-    # the port that this service should serve on
   - port: 6379
   selector:
     app: redis
     tier: backend
     role: slave
 ---
-apiVersion: v1
-kind: ReplicationController
+apiVersion: extensions/v1beta1
+kind: Deployment
 metadata:
   name: redis-slave
-  # these labels can be applied automatically
-  # from the labels in the pod template if not set
-  labels:
-    app: redis
-    role: slave
-    tier: backend
 spec:
-  # this replicas value is default
-  # modify it according to your case
   replicas: 2
-  # selector can be applied automatically
-  # from the labels in the pod template if not set
-  # selector:
-  #   app: guestbook
-  #   role: slave
-  #   tier: backend
   template:
     metadata:
       labels:
@@ -110,7 +80,7 @@ spec:
           # If your cluster config does not include a dns service, then to
           # instead access an environment variable to find the master
           # service's host, comment out the 'value: dns' line above, and
-          # uncomment the line below.
+          # uncomment the line below:
           # value: env
         ports:
         - containerPort: 6379
@@ -127,30 +97,17 @@ spec:
   # an external load-balanced IP for the frontend service.
   # type: LoadBalancer
   ports:
-    # the port that this service should serve on
   - port: 80
   selector:
     app: guestbook
     tier: frontend
 ---
-apiVersion: v1
-kind: ReplicationController
+apiVersion: extensions/v1beta1
+kind: Deployment
 metadata:
   name: frontend
-  # these labels can be applied automatically
-  # from the labels in the pod template if not set
-  labels:
-    app: guestbook
-    tier: frontend
 spec:
-  # this replicas value is default
-  # modify it according to your case
   replicas: 3
-  # selector can be applied automatically
-  # from the labels in the pod template if not set
-  # selector:
-  #   app: guestbook
-  #   tier: frontend
   template:
     metadata:
       labels:
@@ -159,7 +116,7 @@ spec:
     spec:
       containers:
       - name: php-redis
-        image: gcr.io/google_samples/gb-frontend:v3
+        image: gcr.io/google-samples/gb-frontend:v4
         resources:
           requests:
             cpu: 100m
@@ -170,7 +127,7 @@ spec:
           # If your cluster config does not include a dns service, then to
           # instead access environment variables to find service host
           # info, comment out the 'value: dns' line above, and uncomment the
-          # line below.
+          # line below:
           # value: env
         ports:
         - containerPort: 80

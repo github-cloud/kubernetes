@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,6 +51,11 @@ if [ "$cert_ip" == "_use_aws_external_ip_" ]; then
   fi
 fi
 
+if [ "$cert_ip" == "_use_azure_dns_name_" ]; then
+  cert_ip=$(uname -n | awk -F. '{ print $2 }').cloudapp.net
+  use_cn=true
+fi
+
 sans="IP:${cert_ip}"
 if [[ -n "${extra_sans}" ]]; then
   sans="${sans},${extra_sans}"
@@ -94,7 +99,11 @@ else
     cp -p pki/issued/kubernetes-master.crt "${cert_dir}/server.cert" > /dev/null 2>&1
     cp -p pki/private/kubernetes-master.key "${cert_dir}/server.key" > /dev/null 2>&1
 fi
-./easyrsa build-client-full kubecfg nopass > /dev/null 2>&1
+# Make a superuser client cert with subject "O=system:masters, CN=kubecfg"
+./easyrsa --dn-mode=org \
+  --req-cn=kubecfg --req-org=system:masters \
+  --req-c= --req-st= --req-city= --req-email= --req-ou= \
+  build-client-full kubecfg nopass > /dev/null 2>&1
 cp -p pki/ca.crt "${cert_dir}/ca.crt"
 cp -p pki/issued/kubecfg.crt "${cert_dir}/kubecfg.crt"
 cp -p pki/private/kubecfg.key "${cert_dir}/kubecfg.key"

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,9 +23,14 @@ import (
 
 // NewKubelet creates a new hyperkube Server object that includes the
 // description and flags.
-func NewKubelet() *Server {
-	s := options.NewKubeletServer()
+func NewKubelet() (*Server, error) {
+	s, err := options.NewKubeletServer()
+	if err != nil {
+		return nil, err
+	}
+
 	hks := Server{
+		name:        "kubelet",
 		SimpleUsage: "kubelet",
 		Long: `The kubelet binary is responsible for maintaining a set of containers on a
 		particular node. It syncs data from a variety of sources including a
@@ -33,10 +38,10 @@ func NewKubelet() *Server {
 		queries Docker to see what is currently running.  It synchronizes the
 		configuration data, with the running set of containers by starting or stopping
 		Docker containers.`,
-		Run: func(_ *Server, _ []string) error {
+		Run: func(_ *Server, _ []string, stopCh <-chan struct{}) error {
 			return app.Run(s, nil)
 		},
 	}
 	s.AddFlags(hks.Flags())
-	return &hks
+	return &hks, nil
 }

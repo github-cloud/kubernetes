@@ -1,4 +1,4 @@
-# Copyright 2016 The Kubernetes Authors All rights reserved.
+# Copyright 2016 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,42 +15,40 @@
 # Build the hyperkube image.
 #
 # Usage:
-#   VERSION=v1.1.2 [REGISTRY="gcr.io/google_containers"] make build
+#   [ARCH=amd64] [REGISTRY="gcr.io/google-containers"] make (build|push) VERSION={some_released_version_of_kubernetes}
 
-REGISTRY?="gcr.io/google_containers"
-ARCH=amd64
-BASEIMAGE=debian:jessie
-TEMP_DIR:=$(shell mktemp -d)
+REGISTRY?=gcr.io/google-containers
+ARCH?=amd64
+HYPERKUBE_BIN?=_output/dockerized/bin/linux/$(ARCH)/hyperkube
 
-## Comment in for arm builds, must be run on an arm machine
-# ARCH=arm
-# need to escape '/' for the regexp below
-# BASEIMAGE=armbuild\\/debian:jessie
+BASEIMAGE=gcr.io/google-containers/debian-hyperkube-base-$(ARCH):0.5
+TEMP_DIR:=$(shell mktemp -d -t hyperkubeXXXXXX)
 
 all: build
 
 build:
+
 ifndef VERSION
     $(error VERSION is undefined)
 endif
-	cp ./* ${TEMP_DIR}
-	cp ../../saltbase/salt/helpers/safe_format_and_mount ${TEMP_DIR}
-	cp ../../saltbase/salt/generate-cert/make-ca-cert.sh ${TEMP_DIR}
-	cp ../../../_output/dockerized/bin/linux/${ARCH}/hyperkube ${TEMP_DIR}
-	cd ${TEMP_DIR} && sed -i.back "s|VERSION|${VERSION}|g" master-multi.json master.json kube-proxy.json
-	cd ${TEMP_DIR} && sed -i.back "s|ARCH|${ARCH}|g" master-multi.json master.json kube-proxy.json
+	cp -r ./* ${TEMP_DIR}
+	cp ../../../${HYPERKUBE_BIN} ${TEMP_DIR}
+
+	chmod a+rx ${TEMP_DIR}/hyperkube
+
 	cd ${TEMP_DIR} && sed -i.back "s|BASEIMAGE|${BASEIMAGE}|g" Dockerfile
-	rm ${TEMP_DIR}/*.back
-	docker build -t ${REGISTRY}/hyperkube-${ARCH}:${VERSION} ${TEMP_DIR}
-	# Backward compatibility.  TODO: deprecate this image tag
-ifeq ($(ARCH),amd64)
-	docker tag -f ${REGISTRY}/hyperkube-${ARCH}:${VERSION} ${REGISTRY}/hyperkube:${VERSION}
-endif
+
+	# Register /usr/bin/qemu-ARCH-static as the handler for non-x86 binaries in the kernel
+	docker run --rm --privileged multiarch/qemu-user-static:register --reset
+	docker build --pull -t ${REGISTRY}/hyperkube-${ARCH}:${VERSION} ${TEMP_DIR}
+	rm -rf "${TEMP_DIR}"
 
 push: build
-	gcloud docker push ${REGISTRY}/hyperkube-${ARCH}:${VERSION}
+	gcloud docker -- push ${REGISTRY}/hyperkube-${ARCH}:${VERSION}
 ifeq ($(ARCH),amd64)
-	gcloud docker push ${REGISTRY}/hyperkube:${VERSION}
+	docker rmi ${REGISTRY}/hyperkube:${VERSION} 2>/dev/null || true
+	docker tag ${REGISTRY}/hyperkube-${ARCH}:${VERSION} ${REGISTRY}/hyperkube:${VERSION}
+	gcloud docker -- push ${REGISTRY}/hyperkube:${VERSION}
 endif
 
-.PHONY: all
+.PHONY: build push all

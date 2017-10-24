@@ -1,7 +1,12 @@
-assignees:
-  - brendandburns
-  - davidopp
+reviewers:
   - eparis
+  - jbeda
+  - mikedanese
+  - roberthbailey
+  - zmerlynn
+approvers:
+  - eparis
+  - jbeda
   - mikedanese
   - roberthbailey
   - zmerlynn

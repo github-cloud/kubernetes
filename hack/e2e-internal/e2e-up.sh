@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright 2015 The Kubernetes Authors All rights reserved.
+# Copyright 2015 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,4 +29,16 @@ source "${KUBE_ROOT}/cluster/kube-util.sh"
 
 prepare-e2e
 
-test-setup
+if [[ "${FEDERATION:-}" == "true" ]]; then
+  cur_ip_octet2=180
+  for zone in ${E2E_ZONES};do
+    (
+      export CLUSTER_IP_RANGE="10.${cur_ip_octet2}.0.0/16"
+      set-federation-zone-vars "$zone"
+      test-setup
+    )
+    cur_ip_octet2="$((cur_ip_octet2 + 1))"
+  done
+else
+  test-setup
+fi

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,14 +18,20 @@ package rbd
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset/fake"
-	"k8s.io/kubernetes/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/kubernetes/pkg/util/mount"
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
@@ -38,16 +44,16 @@ func TestCanSupport(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/rbd")
 	if err != nil {
 		t.Errorf("Can't find the plugin by name")
 	}
-	if plug.Name() != "kubernetes.io/rbd" {
-		t.Errorf("Wrong name: %s", plug.Name())
+	if plug.GetPluginName() != "kubernetes.io/rbd" {
+		t.Errorf("Wrong name: %s", plug.GetPluginName())
 	}
-	if plug.CanSupport(&volume.Spec{Volume: &api.Volume{VolumeSource: api.VolumeSource{}}}) {
+	if plug.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{}}}) {
 		t.Errorf("Expected false")
 	}
 }
@@ -69,7 +75,7 @@ func (fake *fakeDiskManager) Cleanup() {
 func (fake *fakeDiskManager) MakeGlobalPDName(disk rbd) string {
 	return fake.tmpDir
 }
-func (fake *fakeDiskManager) AttachDisk(b rbdBuilder) error {
+func (fake *fakeDiskManager) AttachDisk(b rbdMounter) error {
 	globalPath := b.manager.MakeGlobalPDName(*b.rbd)
 	err := os.MkdirAll(globalPath, 0750)
 	if err != nil {
@@ -78,13 +84,21 @@ func (fake *fakeDiskManager) AttachDisk(b rbdBuilder) error {
 	return nil
 }
 
-func (fake *fakeDiskManager) DetachDisk(c rbdCleaner, mntPath string) error {
+func (fake *fakeDiskManager) DetachDisk(c rbdUnmounter, mntPath string) error {
 	globalPath := c.manager.MakeGlobalPDName(*c.rbd)
 	err := os.RemoveAll(globalPath)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func (fake *fakeDiskManager) CreateImage(provisioner *rbdVolumeProvisioner) (r *v1.RBDPersistentVolumeSource, volumeSizeGB int, err error) {
+	return nil, 0, fmt.Errorf("not implemented")
+}
+
+func (fake *fakeDiskManager) DeleteImage(deleter *rbdVolumeDeleter) error {
+	return fmt.Errorf("not implemented")
 }
 
 func doTestPlugin(t *testing.T, spec *volume.Spec) {
@@ -95,7 +109,7 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, nil, nil))
 
 	plug, err := plugMgr.FindPluginByName("kubernetes.io/rbd")
 	if err != nil {
@@ -103,21 +117,22 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 	}
 	fdm := NewFakeDiskManager()
 	defer fdm.Cleanup()
-	builder, err := plug.(*rbdPlugin).newBuilderInternal(spec, types.UID("poduid"), fdm, &mount.FakeMounter{}, "secrets")
+	exec := mount.NewFakeExec(nil)
+	mounter, err := plug.(*rbdPlugin).newMounterInternal(spec, types.UID("poduid"), fdm, &mount.FakeMounter{}, exec, "secrets")
 	if err != nil {
-		t.Errorf("Failed to make a new Builder: %v", err)
+		t.Errorf("Failed to make a new Mounter: %v", err)
 	}
-	if builder == nil {
-		t.Error("Got a nil Builder")
+	if mounter == nil {
+		t.Error("Got a nil Mounter")
 	}
 
-	path := builder.GetPath()
+	path := mounter.GetPath()
 	expectedPath := fmt.Sprintf("%s/pods/poduid/volumes/kubernetes.io~rbd/vol1", tmpDir)
 	if path != expectedPath {
 		t.Errorf("Unexpected path, expected %q, got: %q", expectedPath, path)
 	}
 
-	if err := builder.SetUp(nil); err != nil {
+	if err := mounter.SetUp(nil); err != nil {
 		t.Errorf("Expected success, got: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -127,23 +142,16 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 			t.Errorf("SetUp() failed: %v", err)
 		}
 	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", path)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
-	}
 
-	cleaner, err := plug.(*rbdPlugin).newCleanerInternal("vol1", types.UID("poduid"), fdm, &mount.FakeMounter{})
+	unmounter, err := plug.(*rbdPlugin).newUnmounterInternal("vol1", types.UID("poduid"), fdm, &mount.FakeMounter{}, exec)
 	if err != nil {
-		t.Errorf("Failed to make a new Cleaner: %v", err)
+		t.Errorf("Failed to make a new Unmounter: %v", err)
 	}
-	if cleaner == nil {
-		t.Error("Got a nil Cleaner")
+	if unmounter == nil {
+		t.Error("Got a nil Unmounter")
 	}
 
-	if err := cleaner.TearDown(); err != nil {
+	if err := unmounter.TearDown(); err != nil {
 		t.Errorf("Expected success, got: %v", err)
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -154,10 +162,10 @@ func doTestPlugin(t *testing.T, spec *volume.Spec) {
 }
 
 func TestPluginVolume(t *testing.T) {
-	vol := &api.Volume{
+	vol := &v1.Volume{
 		Name: "vol1",
-		VolumeSource: api.VolumeSource{
-			RBD: &api.RBDVolumeSource{
+		VolumeSource: v1.VolumeSource{
+			RBD: &v1.RBDVolumeSource{
 				CephMonitors: []string{"a", "b"},
 				RBDImage:     "bar",
 				FSType:       "ext4",
@@ -167,13 +175,13 @@ func TestPluginVolume(t *testing.T) {
 	doTestPlugin(t, volume.NewSpecFromVolume(vol))
 }
 func TestPluginPersistentVolume(t *testing.T) {
-	vol := &api.PersistentVolume{
-		ObjectMeta: api.ObjectMeta{
+	vol := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "vol1",
 		},
-		Spec: api.PersistentVolumeSpec{
-			PersistentVolumeSource: api.PersistentVolumeSource{
-				RBD: &api.RBDVolumeSource{
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				RBD: &v1.RBDPersistentVolumeSource{
 					CephMonitors: []string{"a", "b"},
 					RBDImage:     "bar",
 					FSType:       "ext4",
@@ -192,49 +200,165 @@ func TestPersistentClaimReadOnlyFlag(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	pv := &api.PersistentVolume{
-		ObjectMeta: api.ObjectMeta{
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "pvA",
 		},
-		Spec: api.PersistentVolumeSpec{
-			PersistentVolumeSource: api.PersistentVolumeSource{
-				RBD: &api.RBDVolumeSource{
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				RBD: &v1.RBDPersistentVolumeSource{
 					CephMonitors: []string{"a", "b"},
 					RBDImage:     "bar",
 					FSType:       "ext4",
 				},
 			},
-			ClaimRef: &api.ObjectReference{
+			ClaimRef: &v1.ObjectReference{
 				Name: "claimA",
 			},
 		},
 	}
 
-	claim := &api.PersistentVolumeClaim{
-		ObjectMeta: api.ObjectMeta{
+	claim := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "claimA",
 			Namespace: "nsA",
 		},
-		Spec: api.PersistentVolumeClaimSpec{
+		Spec: v1.PersistentVolumeClaimSpec{
 			VolumeName: "pvA",
 		},
-		Status: api.PersistentVolumeClaimStatus{
-			Phase: api.ClaimBound,
+		Status: v1.PersistentVolumeClaimStatus{
+			Phase: v1.ClaimBound,
 		},
 	}
 
 	client := fake.NewSimpleClientset(pv, claim)
 
 	plugMgr := volume.VolumePluginMgr{}
-	plugMgr.InitPlugins(ProbeVolumePlugins(), volumetest.NewFakeVolumeHost(tmpDir, client, nil))
+	plugMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, volumetest.NewFakeVolumeHost(tmpDir, client, nil))
 	plug, _ := plugMgr.FindPluginByName(rbdPluginName)
 
-	// readOnly bool is supplied by persistent-claim volume source when its builder creates other volumes
+	// readOnly bool is supplied by persistent-claim volume source when its mounter creates other volumes
 	spec := volume.NewSpecFromPersistentVolume(pv, true)
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: types.UID("poduid")}}
-	builder, _ := plug.NewBuilder(spec, pod, volume.VolumeOptions{})
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID("poduid")}}
+	mounter, _ := plug.NewMounter(spec, pod, volume.VolumeOptions{})
+	if mounter == nil {
+		t.Fatalf("Got a nil Mounter")
+	}
 
-	if !builder.GetAttributes().ReadOnly {
-		t.Errorf("Expected true for builder.IsReadOnly")
+	if !mounter.GetAttributes().ReadOnly {
+		t.Errorf("Expected true for mounter.IsReadOnly")
+	}
+}
+
+func TestPersistAndLoadRBD(t *testing.T) {
+	tmpDir, err := utiltesting.MkTmpdir("rbd_test")
+	if err != nil {
+		t.Fatalf("error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	testcases := []struct {
+		rbdMounter               rbdMounter
+		expectedJSONStr          string
+		expectedLoadedRBDMounter rbdMounter
+	}{
+		{
+			rbdMounter{},
+			`{"Mon":null,"Id":"","Keyring":"","Secret":""}`,
+			rbdMounter{},
+		},
+		{
+			rbdMounter{
+				rbd: &rbd{
+					podUID:          "poduid",
+					Pool:            "kube",
+					Image:           "some-test-image",
+					ReadOnly:        false,
+					MetricsProvider: volume.NewMetricsStatFS("/tmp"),
+				},
+				Mon:     []string{"127.0.0.1"},
+				Id:      "kube",
+				Keyring: "",
+				Secret:  "QVFEcTdKdFp4SmhtTFJBQUNwNDI3UnhGRzBvQ1Y0SUJwLy9pRUE9PQ==",
+			},
+			`
+{
+	"Pool": "kube",
+	"Image": "some-test-image",
+	"ReadOnly": false,
+	"Mon": ["127.0.0.1"],
+	"Id": "kube",
+	"Keyring": "",
+	"Secret": "QVFEcTdKdFp4SmhtTFJBQUNwNDI3UnhGRzBvQ1Y0SUJwLy9pRUE9PQ=="
+}
+			`,
+			rbdMounter{
+				rbd: &rbd{
+					Pool:     "kube",
+					Image:    "some-test-image",
+					ReadOnly: false,
+				},
+				Mon:     []string{"127.0.0.1"},
+				Id:      "kube",
+				Keyring: "",
+				Secret:  "QVFEcTdKdFp4SmhtTFJBQUNwNDI3UnhGRzBvQ1Y0SUJwLy9pRUE9PQ==",
+			},
+		},
+	}
+
+	util := &RBDUtil{}
+	for _, c := range testcases {
+		err = util.persistRBD(c.rbdMounter, tmpDir)
+		if err != nil {
+			t.Errorf("failed to persist rbd: %v, err: %v", c.rbdMounter, err)
+		}
+		jsonFile := filepath.Join(tmpDir, "rbd.json")
+		jsonData, err := ioutil.ReadFile(jsonFile)
+		if err != nil {
+			t.Errorf("failed to read json file %s: %v", jsonFile, err)
+		}
+		if !assert.JSONEq(t, c.expectedJSONStr, string(jsonData)) {
+			t.Errorf("json file does not match expected one: %s, should be %s", string(jsonData), c.expectedJSONStr)
+		}
+		tmpRBDMounter := rbdMounter{}
+		err = util.loadRBD(&tmpRBDMounter, tmpDir)
+		if err != nil {
+			t.Errorf("faild to load rbd: %v", err)
+		}
+		if !reflect.DeepEqual(tmpRBDMounter, c.expectedLoadedRBDMounter) {
+			t.Errorf("loaded rbd does not equal to expected one: %v, should be %v", tmpRBDMounter, c.rbdMounter)
+		}
+	}
+}
+
+func TestGetSecretNameAndNamespace(t *testing.T) {
+	secretName := "test-secret-name"
+	secretNamespace := "test-secret-namespace"
+
+	volSpec := &volume.Spec{
+		PersistentVolume: &v1.PersistentVolume{
+			Spec: v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					RBD: &v1.RBDPersistentVolumeSource{
+						CephMonitors: []string{"a", "b"},
+						RBDImage:     "bar",
+						FSType:       "ext4",
+					},
+				},
+			},
+		},
+	}
+
+	secretRef := new(v1.SecretReference)
+	secretRef.Name = secretName
+	secretRef.Namespace = secretNamespace
+	volSpec.PersistentVolume.Spec.PersistentVolumeSource.RBD.SecretRef = secretRef
+
+	foundSecretName, foundSecretNamespace, err := getSecretNameAndNamespace(volSpec, "default")
+	if err != nil {
+		t.Errorf("getSecretNameAndNamespace failed to get Secret's name and namespace: %v", err)
+	}
+	if strings.Compare(secretName, foundSecretName) != 0 || strings.Compare(secretNamespace, foundSecretNamespace) != 0 {
+		t.Errorf("getSecretNameAndNamespace returned incorrect values, expected %s and %s but got %s and %s", secretName, secretNamespace, foundSecretName, foundSecretNamespace)
 	}
 }

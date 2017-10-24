@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,45 +19,70 @@ package v1
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	v1 "k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/conversion"
-	"k8s.io/kubernetes/pkg/runtime"
+	batchv1 "k8s.io/api/batch/v1"
+
+	"k8s.io/apimachinery/pkg/conversion"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/api/v1"
+	"k8s.io/kubernetes/pkg/apis/batch"
 )
 
-func addConversionFuncs(scheme *runtime.Scheme) {
+func addConversionFuncs(scheme *runtime.Scheme) error {
 	// Add non-generated conversion functions
 	err := scheme.AddConversionFuncs(
-		Convert_api_PodSpec_To_v1_PodSpec,
-		Convert_v1_PodSpec_To_api_PodSpec,
+		Convert_batch_JobSpec_To_v1_JobSpec,
+		Convert_v1_JobSpec_To_batch_JobSpec,
 	)
 	if err != nil {
-		// If one of the conversion functions is malformed, detect it immediately.
-		panic(err)
+		return err
 	}
 
-	err = api.Scheme.AddFieldLabelConversionFunc("batch/v1", "Job",
+	return scheme.AddFieldLabelConversionFunc("batch/v1", "Job",
 		func(label, value string) (string, string, error) {
 			switch label {
 			case "metadata.name", "metadata.namespace", "status.successful":
 				return label, value, nil
 			default:
-				return "", "", fmt.Errorf("field label not supported: %s", label)
+				return "", "", fmt.Errorf("field label %q not supported for batchv1.Job", label)
 			}
-		})
-	if err != nil {
-		// If one of the conversion functions is malformed, detect it immediately.
-		panic(err)
+		},
+	)
+}
+
+func Convert_batch_JobSpec_To_v1_JobSpec(in *batch.JobSpec, out *batchv1.JobSpec, s conversion.Scope) error {
+	out.Parallelism = in.Parallelism
+	out.Completions = in.Completions
+	out.ActiveDeadlineSeconds = in.ActiveDeadlineSeconds
+	out.BackoffLimit = in.BackoffLimit
+	out.Selector = in.Selector
+	if in.ManualSelector != nil {
+		out.ManualSelector = new(bool)
+		*out.ManualSelector = *in.ManualSelector
+	} else {
+		out.ManualSelector = nil
 	}
+
+	if err := k8s_api_v1.Convert_api_PodTemplateSpec_To_v1_PodTemplateSpec(&in.Template, &out.Template, s); err != nil {
+		return err
+	}
+	return nil
 }
 
-// The following two PodSpec conversions functions where copied from pkg/api/conversion.go
-// for the generated functions to work properly.
-// This should be fixed: https://github.com/kubernetes/kubernetes/issues/12977
-func Convert_api_PodSpec_To_v1_PodSpec(in *api.PodSpec, out *v1.PodSpec, s conversion.Scope) error {
-	return v1.Convert_api_PodSpec_To_v1_PodSpec(in, out, s)
-}
+func Convert_v1_JobSpec_To_batch_JobSpec(in *batchv1.JobSpec, out *batch.JobSpec, s conversion.Scope) error {
+	out.Parallelism = in.Parallelism
+	out.Completions = in.Completions
+	out.ActiveDeadlineSeconds = in.ActiveDeadlineSeconds
+	out.BackoffLimit = in.BackoffLimit
+	out.Selector = in.Selector
+	if in.ManualSelector != nil {
+		out.ManualSelector = new(bool)
+		*out.ManualSelector = *in.ManualSelector
+	} else {
+		out.ManualSelector = nil
+	}
 
-func Convert_v1_PodSpec_To_api_PodSpec(in *v1.PodSpec, out *api.PodSpec, s conversion.Scope) error {
-	return v1.Convert_v1_PodSpec_To_api_PodSpec(in, out, s)
+	if err := k8s_api_v1.Convert_v1_PodTemplateSpec_To_api_PodTemplateSpec(&in.Template, &out.Template, s); err != nil {
+		return err
+	}
+	return nil
 }

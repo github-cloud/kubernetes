@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ func (c *Mock) VersionInfo() (*cadvisorapi.VersionInfo, error) {
 	return args.Get(0).(*cadvisorapi.VersionInfo), args.Error(1)
 }
 
-func (c *Mock) DockerImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
+func (c *Mock) ImagesFsInfo() (cadvisorapiv2.FsInfo, error) {
 	args := c.Called()
 	return args.Get(0).(cadvisorapiv2.FsInfo), args.Error(1)
 }
@@ -82,4 +82,14 @@ func (c *Mock) RootFsInfo() (cadvisorapiv2.FsInfo, error) {
 func (c *Mock) WatchEvents(request *events.Request) (*events.EventChannel, error) {
 	args := c.Called()
 	return args.Get(0).(*events.EventChannel), args.Error(1)
+}
+
+func (c *Mock) HasDedicatedImageFs() (bool, error) {
+	args := c.Called()
+	return args.Get(0).(bool), args.Error(1)
+}
+
+func (c *Mock) GetFsInfoByFsUUID(uuid string) (cadvisorapiv2.FsInfo, error) {
+	args := c.Called(uuid)
+	return args.Get(0).(cadvisorapiv2.FsInfo), args.Error(1)
 }

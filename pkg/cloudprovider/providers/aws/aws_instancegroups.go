@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ import (
 )
 
 // AWSCloud implements InstanceGroups
-var _ InstanceGroups = &AWSCloud{}
+var _ InstanceGroups = &Cloud{}
 
 // ResizeInstanceGroup sets the size of the specificed instancegroup Exported
 // so it can be used by the e2e tests, which don't want to instantiate a full
@@ -37,15 +37,15 @@ func ResizeInstanceGroup(asg ASG, instanceGroupName string, size int) error {
 		MaxSize:              aws.Int64(int64(size)),
 	}
 	if _, err := asg.UpdateAutoScalingGroup(request); err != nil {
-		return fmt.Errorf("error resizing AWS autoscaling group: %v", err)
+		return fmt.Errorf("error resizing AWS autoscaling group: %q", err)
 	}
 	return nil
 }
 
 // Implement InstanceGroups.ResizeInstanceGroup
 // Set the size to the fixed size
-func (a *AWSCloud) ResizeInstanceGroup(instanceGroupName string, size int) error {
-	return ResizeInstanceGroup(a.asg, instanceGroupName, size)
+func (c *Cloud) ResizeInstanceGroup(instanceGroupName string, size int) error {
+	return ResizeInstanceGroup(c.asg, instanceGroupName, size)
 }
 
 // DescribeInstanceGroup gets info about the specified instancegroup
@@ -57,7 +57,7 @@ func DescribeInstanceGroup(asg ASG, instanceGroupName string) (InstanceGroupInfo
 	}
 	response, err := asg.DescribeAutoScalingGroups(request)
 	if err != nil {
-		return nil, fmt.Errorf("error listing AWS autoscaling group (%s): %v", instanceGroupName, err)
+		return nil, fmt.Errorf("error listing AWS autoscaling group (%s): %q", instanceGroupName, err)
 	}
 
 	if len(response.AutoScalingGroups) == 0 {
@@ -72,8 +72,8 @@ func DescribeInstanceGroup(asg ASG, instanceGroupName string) (InstanceGroupInfo
 
 // Implement InstanceGroups.DescribeInstanceGroup
 // Queries the cloud provider for information about the specified instance group
-func (a *AWSCloud) DescribeInstanceGroup(instanceGroupName string) (InstanceGroupInfo, error) {
-	return DescribeInstanceGroup(a.asg, instanceGroupName)
+func (c *Cloud) DescribeInstanceGroup(instanceGroupName string) (InstanceGroupInfo, error) {
+	return DescribeInstanceGroup(c.asg, instanceGroupName)
 }
 
 // awsInstanceGroup implements InstanceGroupInfo
