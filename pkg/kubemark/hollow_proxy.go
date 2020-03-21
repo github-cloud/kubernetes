@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,75 +17,123 @@ limitations under the License.
 package kubemark
 
 import (
+	"fmt"
+	"net"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	clientset "k8s.io/client-go/kubernetes"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 	proxyapp "k8s.io/kubernetes/cmd/kube-proxy/app"
-	"k8s.io/kubernetes/cmd/kube-proxy/app/options"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
+	"k8s.io/kubernetes/pkg/proxy"
 	proxyconfig "k8s.io/kubernetes/pkg/proxy/config"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/proxy/iptables"
+	proxyutiliptables "k8s.io/kubernetes/pkg/proxy/util/iptables"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
+	utilnode "k8s.io/kubernetes/pkg/util/node"
+	utilsysctl "k8s.io/kubernetes/pkg/util/sysctl"
+	utilexec "k8s.io/utils/exec"
+	utilpointer "k8s.io/utils/pointer"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
 )
 
 type HollowProxy struct {
 	ProxyServer *proxyapp.ProxyServer
 }
 
-type FakeProxyHandler struct{}
+type FakeProxier struct {
+	proxyconfig.NoopEndpointSliceHandler
+	proxyconfig.NoopNodeHandler
+}
 
-func (*FakeProxyHandler) OnServiceUpdate(services []api.Service)      {}
-func (*FakeProxyHandler) OnEndpointsUpdate(endpoints []api.Endpoints) {}
-
-type FakeProxier struct{}
-
-func (*FakeProxier) OnServiceUpdate(services []api.Service) {}
-func (*FakeProxier) Sync()                                  {}
+func (*FakeProxier) Sync() {}
 func (*FakeProxier) SyncLoop() {
 	select {}
 }
+func (*FakeProxier) OnServiceAdd(service *v1.Service)                        {}
+func (*FakeProxier) OnServiceUpdate(oldService, service *v1.Service)         {}
+func (*FakeProxier) OnServiceDelete(service *v1.Service)                     {}
+func (*FakeProxier) OnServiceSynced()                                        {}
+func (*FakeProxier) OnEndpointsAdd(endpoints *v1.Endpoints)                  {}
+func (*FakeProxier) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {}
+func (*FakeProxier) OnEndpointsDelete(endpoints *v1.Endpoints)               {}
+func (*FakeProxier) OnEndpointsSynced()                                      {}
 
 func NewHollowProxyOrDie(
 	nodeName string,
-	client *client.Client,
-	endpointsConfig *proxyconfig.EndpointsConfig,
-	serviceConfig *proxyconfig.ServiceConfig,
+	client clientset.Interface,
+	eventClient v1core.EventsGetter,
 	iptInterface utiliptables.Interface,
+	sysctl utilsysctl.Interface,
+	execer utilexec.Interface,
 	broadcaster record.EventBroadcaster,
 	recorder record.EventRecorder,
-) *HollowProxy {
-	// Create and start Hollow Proxy
-	config := options.NewProxyConfig()
-	config.OOMScoreAdj = util.IntPtr(0)
-	config.ResourceContainer = ""
-	config.NodeRef = &api.ObjectReference{
+	useRealProxier bool,
+	proxierSyncPeriod time.Duration,
+	proxierMinSyncPeriod time.Duration,
+) (*HollowProxy, error) {
+	// Create proxier and service/endpoint handlers.
+	var proxier proxy.Provider
+	var err error
+
+	if useRealProxier {
+		nodeIP := utilnode.GetNodeIP(client, nodeName)
+		if nodeIP == nil {
+			klog.V(0).Infof("can't determine this node's IP, assuming 127.0.0.1")
+			nodeIP = net.ParseIP("127.0.0.1")
+		}
+		// Real proxier with fake iptables, sysctl, etc underneath it.
+		//var err error
+		proxier, err = iptables.NewProxier(
+			iptInterface,
+			sysctl,
+			execer,
+			proxierSyncPeriod,
+			proxierMinSyncPeriod,
+			false,
+			0,
+			proxyutiliptables.NewNoOpLocalDetector(),
+			nodeName,
+			nodeIP,
+			recorder,
+			nil,
+			[]string{},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create proxier: %v", err)
+		}
+	} else {
+		proxier = &FakeProxier{}
+	}
+
+	// Create a Hollow Proxy instance.
+	nodeRef := &v1.ObjectReference{
 		Kind:      "Node",
 		Name:      nodeName,
 		UID:       types.UID(nodeName),
 		Namespace: "",
 	}
-	proxyconfig.NewSourceAPI(
-		client,
-		30*time.Second,
-		serviceConfig.Channel("api"),
-		endpointsConfig.Channel("api"),
-	)
-
-	hollowProxy, err := proxyapp.NewProxyServer(client, config, iptInterface, &FakeProxier{}, broadcaster, recorder, nil, "fake")
-	if err != nil {
-		glog.Fatalf("Error while creating ProxyServer: %v\n", err)
-	}
 	return &HollowProxy{
-		ProxyServer: hollowProxy,
-	}
+		ProxyServer: &proxyapp.ProxyServer{
+			Client:           client,
+			EventClient:      eventClient,
+			IptInterface:     iptInterface,
+			Proxier:          proxier,
+			Broadcaster:      broadcaster,
+			Recorder:         recorder,
+			ProxyMode:        "fake",
+			NodeRef:          nodeRef,
+			OOMScoreAdj:      utilpointer.Int32Ptr(0),
+			ConfigSyncPeriod: 30 * time.Second,
+		},
+	}, nil
 }
 
 func (hp *HollowProxy) Run() {
 	if err := hp.ProxyServer.Run(); err != nil {
-		glog.Fatalf("Error while running proxy: %v\n", err)
+		klog.Fatalf("Error while running proxy: %v\n", err)
 	}
 }

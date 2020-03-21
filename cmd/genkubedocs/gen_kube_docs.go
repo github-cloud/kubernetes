@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,13 +20,15 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
+	"github.com/spf13/pflag"
 	"k8s.io/kubernetes/cmd/genutils"
 	apiservapp "k8s.io/kubernetes/cmd/kube-apiserver/app"
 	cmapp "k8s.io/kubernetes/cmd/kube-controller-manager/app"
 	proxyapp "k8s.io/kubernetes/cmd/kube-proxy/app"
+	schapp "k8s.io/kubernetes/cmd/kube-scheduler/app"
+	kubeadmapp "k8s.io/kubernetes/cmd/kubeadm/app/cmd"
 	kubeletapp "k8s.io/kubernetes/cmd/kubelet/app"
-	schapp "k8s.io/kubernetes/plugin/cmd/kube-scheduler/app"
 )
 
 func main() {
@@ -51,23 +53,35 @@ func main() {
 	case "kube-apiserver":
 		// generate docs for kube-apiserver
 		apiserver := apiservapp.NewAPIServerCommand()
-		cobra.GenMarkdownTree(apiserver, outDir)
+		doc.GenMarkdownTree(apiserver, outDir)
 	case "kube-controller-manager":
 		// generate docs for kube-controller-manager
 		controllermanager := cmapp.NewControllerManagerCommand()
-		cobra.GenMarkdownTree(controllermanager, outDir)
+		doc.GenMarkdownTree(controllermanager, outDir)
 	case "kube-proxy":
 		// generate docs for kube-proxy
 		proxy := proxyapp.NewProxyCommand()
-		cobra.GenMarkdownTree(proxy, outDir)
+		doc.GenMarkdownTree(proxy, outDir)
 	case "kube-scheduler":
 		// generate docs for kube-scheduler
 		scheduler := schapp.NewSchedulerCommand()
-		cobra.GenMarkdownTree(scheduler, outDir)
+		doc.GenMarkdownTree(scheduler, outDir)
 	case "kubelet":
 		// generate docs for kubelet
 		kubelet := kubeletapp.NewKubeletCommand()
-		cobra.GenMarkdownTree(kubelet, outDir)
+		doc.GenMarkdownTree(kubelet, outDir)
+	case "kubeadm":
+		// resets global flags created by kubelet or other commands e.g.
+		// --azure-container-registry-config from pkg/credentialprovider/azure
+		// --version pkg/version/verflag
+		pflag.CommandLine = pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
+
+		// generate docs for kubeadm
+		kubeadm := kubeadmapp.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
+		doc.GenMarkdownTree(kubeadm, outDir)
+
+		// cleanup generated code for usage as include in the website
+		MarkdownPostProcessing(kubeadm, outDir, cleanupForInclude)
 	default:
 		fmt.Fprintf(os.Stderr, "Module %s is not supported", module)
 		os.Exit(1)

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,18 +18,21 @@ package pleg
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/klog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/sets"
-	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 // GenericPLEG is an extremely simple generic PLEG that relies solely on
-// periodic listing to discover container changes. It should be be used
+// periodic listing to discover container changes. It should be used
 // as temporary replacement for container runtimes do not support a proper
 // event generator yet.
 //
@@ -39,7 +42,7 @@ import (
 // container. In the case of relisting failure, the window may become longer.
 // Note that this assumption is not unique -- many kubelet internal components
 // rely on terminated containers as tombstones for bookkeeping purposes. The
-// garbage collector is implemented to work with such situtations. However, to
+// garbage collector is implemented to work with such situations. However, to
 // guarantee that kubelet can handle missing container events, it is
 // recommended to set the relist period short and have an auxiliary, longer
 // periodic sync in kubelet as the safety net.
@@ -53,9 +56,14 @@ type GenericPLEG struct {
 	// The internal cache for pod/container information.
 	podRecords podRecords
 	// Time of the last relisting.
-	lastRelistTime time.Time
+	relistTime atomic.Value
 	// Cache for storing the runtime states required for syncing pods.
 	cache kubecontainer.Cache
+	// For testability.
+	clock clock.Clock
+	// Pods that failed to have their status retrieved during a relist. These pods will be
+	// retried during the next relisting.
+	podsToReinspect map[types.UID]*kubecontainer.Pod
 }
 
 // plegContainerState has a one-to-one mapping to the
@@ -68,10 +76,18 @@ const (
 	plegContainerExited      plegContainerState = "exited"
 	plegContainerUnknown     plegContainerState = "unknown"
 	plegContainerNonExistent plegContainerState = "non-existent"
+
+	// The threshold needs to be greater than the relisting period + the
+	// relisting time, which can vary significantly. Set a conservative
+	// threshold to avoid flipping between healthy and unhealthy.
+	relistThreshold = 3 * time.Minute
 )
 
 func convertState(state kubecontainer.ContainerState) plegContainerState {
 	switch state {
+	case kubecontainer.ContainerStateCreated:
+		// kubelet doesn't use the "created" state yet, hence convert it to "unknown".
+		return plegContainerUnknown
 	case kubecontainer.ContainerStateRunning:
 		return plegContainerRunning
 	case kubecontainer.ContainerStateExited:
@@ -90,18 +106,20 @@ type podRecord struct {
 
 type podRecords map[types.UID]*podRecord
 
+// NewGenericPLEG instantiates a new GenericPLEG object and return it.
 func NewGenericPLEG(runtime kubecontainer.Runtime, channelCapacity int,
-	relistPeriod time.Duration, cache kubecontainer.Cache) PodLifecycleEventGenerator {
+	relistPeriod time.Duration, cache kubecontainer.Cache, clock clock.Clock) PodLifecycleEventGenerator {
 	return &GenericPLEG{
 		relistPeriod: relistPeriod,
 		runtime:      runtime,
 		eventChannel: make(chan *PodLifecycleEvent, channelCapacity),
 		podRecords:   make(podRecords),
 		cache:        cache,
+		clock:        clock,
 	}
 }
 
-// Returns a channel from which the subscriber can recieve PodLifecycleEvent
+// Watch returns a channel from which the subscriber can receive PodLifecycleEvent
 // events.
 // TODO: support multiple subscribers.
 func (g *GenericPLEG) Watch() chan *PodLifecycleEvent {
@@ -113,61 +131,87 @@ func (g *GenericPLEG) Start() {
 	go wait.Until(g.relist, g.relistPeriod, wait.NeverStop)
 }
 
-func generateEvent(podID types.UID, cid string, oldState, newState plegContainerState) *PodLifecycleEvent {
-	glog.V(7).Infof("GenericPLEG: %v/%v: %v -> %v", podID, cid, oldState, newState)
+// Healthy check if PLEG work properly.
+// relistThreshold is the maximum interval between two relist.
+func (g *GenericPLEG) Healthy() (bool, error) {
+	relistTime := g.getRelistTime()
+	if relistTime.IsZero() {
+		return false, fmt.Errorf("pleg has yet to be successful")
+	}
+	// Expose as metric so you can alert on `time()-pleg_last_seen_seconds > nn`
+	metrics.PLEGLastSeen.Set(float64(relistTime.Unix()))
+	elapsed := g.clock.Since(relistTime)
+	if elapsed > relistThreshold {
+		return false, fmt.Errorf("pleg was last seen active %v ago; threshold is %v", elapsed, relistThreshold)
+	}
+	return true, nil
+}
+
+func generateEvents(podID types.UID, cid string, oldState, newState plegContainerState) []*PodLifecycleEvent {
 	if newState == oldState {
 		return nil
 	}
+
+	klog.V(4).Infof("GenericPLEG: %v/%v: %v -> %v", podID, cid, oldState, newState)
 	switch newState {
 	case plegContainerRunning:
-		return &PodLifecycleEvent{ID: podID, Type: ContainerStarted, Data: cid}
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerStarted, Data: cid}}
 	case plegContainerExited:
-		return &PodLifecycleEvent{ID: podID, Type: ContainerDied, Data: cid}
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerDied, Data: cid}}
 	case plegContainerUnknown:
-		// Don't generate any event if the status is unknown.
-		return nil
+		return []*PodLifecycleEvent{{ID: podID, Type: ContainerChanged, Data: cid}}
 	case plegContainerNonExistent:
-		// We report "ContainerDied" when container was stopped OR removed. We
-		// may want to distinguish the two cases in the future.
 		switch oldState {
 		case plegContainerExited:
-			// We already reported that the container died before. There is no
-			// need to do it again.
-			return nil
+			// We already reported that the container died before.
+			return []*PodLifecycleEvent{{ID: podID, Type: ContainerRemoved, Data: cid}}
 		default:
-			return &PodLifecycleEvent{ID: podID, Type: ContainerDied, Data: cid}
+			return []*PodLifecycleEvent{{ID: podID, Type: ContainerDied, Data: cid}, {ID: podID, Type: ContainerRemoved, Data: cid}}
 		}
 	default:
 		panic(fmt.Sprintf("unrecognized container state: %v", newState))
 	}
-	return nil
+}
+
+func (g *GenericPLEG) getRelistTime() time.Time {
+	val := g.relistTime.Load()
+	if val == nil {
+		return time.Time{}
+	}
+	return val.(time.Time)
+}
+
+func (g *GenericPLEG) updateRelistTime(timestamp time.Time) {
+	g.relistTime.Store(timestamp)
 }
 
 // relist queries the container runtime for list of pods/containers, compare
-// with the internal pods/containers, and generats events accordingly.
+// with the internal pods/containers, and generates events accordingly.
 func (g *GenericPLEG) relist() {
-	glog.V(5).Infof("GenericPLEG: Relisting")
-	timestamp := time.Now()
+	klog.V(5).Infof("GenericPLEG: Relisting")
 
-	if !g.lastRelistTime.IsZero() {
-		metrics.PLEGRelistInterval.Observe(metrics.SinceInMicroseconds(g.lastRelistTime))
+	if lastRelistTime := g.getRelistTime(); !lastRelistTime.IsZero() {
+		metrics.PLEGRelistInterval.Observe(metrics.SinceInSeconds(lastRelistTime))
 	}
+
+	timestamp := g.clock.Now()
 	defer func() {
-		// Update the relist time.
-		g.lastRelistTime = timestamp
-		metrics.PLEGRelistLatency.Observe(metrics.SinceInMicroseconds(timestamp))
+		metrics.PLEGRelistDuration.Observe(metrics.SinceInSeconds(timestamp))
 	}()
 
 	// Get all the pods.
 	podList, err := g.runtime.GetPods(true)
 	if err != nil {
-		glog.Errorf("GenericPLEG: Unable to retrieve pods: %v", err)
+		klog.Errorf("GenericPLEG: Unable to retrieve pods: %v", err)
 		return
 	}
+
+	g.updateRelistTime(timestamp)
+
 	pods := kubecontainer.Pods(podList)
-	for _, pod := range pods {
-		g.podRecords.setCurrent(pod)
-	}
+	// update running pod and container count
+	updateRunningPodAndContainerMetrics(pods)
+	g.podRecords.setCurrent(pods)
 
 	// Compare the old and the current pods, and generate events.
 	eventsByPodID := map[types.UID][]*PodLifecycleEvent{}
@@ -177,9 +221,16 @@ func (g *GenericPLEG) relist() {
 		// Get all containers in the old and the new pod.
 		allContainers := getContainersFromPods(oldPod, pod)
 		for _, container := range allContainers {
-			e := computeEvent(oldPod, pod, &container.ID)
-			updateEvents(eventsByPodID, e)
+			events := computeEvents(oldPod, pod, &container.ID)
+			for _, e := range events {
+				updateEvents(eventsByPodID, e)
+			}
 		}
+	}
+
+	var needsReinspection map[types.UID]*kubecontainer.Pod
+	if g.cacheEnabled() {
+		needsReinspection = make(map[types.UID]*kubecontainer.Pod)
 	}
 
 	// If there are events associated with a pod, we should update the
@@ -197,22 +248,56 @@ func (g *GenericPLEG) relist() {
 			// serially may take a while. We should be aware of this and
 			// parallelize if needed.
 			if err := g.updateCache(pod, pid); err != nil {
-				glog.Errorf("PLEG: Ignoring events for pod %s/%s: %v", pod.Name, pod.Namespace, err)
+				// Rely on updateCache calling GetPodStatus to log the actual error.
+				klog.V(4).Infof("PLEG: Ignoring events for pod %s/%s: %v", pod.Name, pod.Namespace, err)
+
+				// make sure we try to reinspect the pod during the next relisting
+				needsReinspection[pid] = pod
+
 				continue
+			} else {
+				// this pod was in the list to reinspect and we did so because it had events, so remove it
+				// from the list (we don't want the reinspection code below to inspect it a second time in
+				// this relist execution)
+				delete(g.podsToReinspect, pid)
 			}
 		}
 		// Update the internal storage and send out the events.
 		g.podRecords.update(pid)
 		for i := range events {
-			g.eventChannel <- events[i]
+			// Filter out events that are not reliable and no other components use yet.
+			if events[i].Type == ContainerChanged {
+				continue
+			}
+			select {
+			case g.eventChannel <- events[i]:
+			default:
+				metrics.PLEGDiscardEvents.Inc()
+				klog.Error("event channel is full, discard this relist() cycle event")
+			}
 		}
 	}
 
 	if g.cacheEnabled() {
+		// reinspect any pods that failed inspection during the previous relist
+		if len(g.podsToReinspect) > 0 {
+			klog.V(5).Infof("GenericPLEG: Reinspecting pods that previously failed inspection")
+			for pid, pod := range g.podsToReinspect {
+				if err := g.updateCache(pod, pid); err != nil {
+					// Rely on updateCache calling GetPodStatus to log the actual error.
+					klog.V(5).Infof("PLEG: pod %s/%s failed reinspection: %v", pod.Name, pod.Namespace, err)
+					needsReinspection[pid] = pod
+				}
+			}
+		}
+
 		// Update the cache timestamp.  This needs to happen *after*
 		// all pods have been properly updated in the cache.
 		g.cache.UpdateTime(timestamp)
 	}
+
+	// make sure we retain the list of pods that need reinspecting the next time relist is called
+	g.podsToReinspect = needsReinspection
 }
 
 func getContainersFromPods(pods ...*kubecontainer.Pod) []*kubecontainer.Container {
@@ -230,11 +315,22 @@ func getContainersFromPods(pods ...*kubecontainer.Pod) []*kubecontainer.Containe
 			cidSet.Insert(cid)
 			containers = append(containers, c)
 		}
+		// Update sandboxes as containers
+		// TODO: keep track of sandboxes explicitly.
+		for _, c := range p.Sandboxes {
+			cid := string(c.ID.ID)
+			if cidSet.Has(cid) {
+				continue
+			}
+			cidSet.Insert(cid)
+			containers = append(containers, c)
+		}
+
 	}
 	return containers
 }
 
-func computeEvent(oldPod, newPod *kubecontainer.Pod, cid *kubecontainer.ContainerID) *PodLifecycleEvent {
+func computeEvents(oldPod, newPod *kubecontainer.Pod, cid *kubecontainer.ContainerID) []*PodLifecycleEvent {
 	var pid types.UID
 	if oldPod != nil {
 		pid = oldPod.ID
@@ -243,27 +339,59 @@ func computeEvent(oldPod, newPod *kubecontainer.Pod, cid *kubecontainer.Containe
 	}
 	oldState := getContainerState(oldPod, cid)
 	newState := getContainerState(newPod, cid)
-	return generateEvent(pid, cid.ID, oldState, newState)
+	return generateEvents(pid, cid.ID, oldState, newState)
 }
 
 func (g *GenericPLEG) cacheEnabled() bool {
 	return g.cache != nil
 }
 
+// getPodIP preserves an older cached status' pod IP if the new status has no pod IPs
+// and its sandboxes have exited
+func (g *GenericPLEG) getPodIPs(pid types.UID, status *kubecontainer.PodStatus) []string {
+	if len(status.IPs) != 0 {
+		return status.IPs
+	}
+
+	oldStatus, err := g.cache.Get(pid)
+	if err != nil || len(oldStatus.IPs) == 0 {
+		return nil
+	}
+
+	for _, sandboxStatus := range status.SandboxStatuses {
+		// If at least one sandbox is ready, then use this status update's pod IP
+		if sandboxStatus.State == runtimeapi.PodSandboxState_SANDBOX_READY {
+			return status.IPs
+		}
+	}
+
+	// For pods with no ready containers or sandboxes (like exited pods)
+	// use the old status' pod IP
+	return oldStatus.IPs
+}
+
 func (g *GenericPLEG) updateCache(pod *kubecontainer.Pod, pid types.UID) error {
 	if pod == nil {
 		// The pod is missing in the current relist. This means that
 		// the pod has no visible (active or inactive) containers.
-		glog.V(8).Infof("PLEG: Delete status for pod %q", string(pid))
+		klog.V(4).Infof("PLEG: Delete status for pod %q", string(pid))
 		g.cache.Delete(pid)
 		return nil
 	}
-	timestamp := time.Now()
+	timestamp := g.clock.Now()
 	// TODO: Consider adding a new runtime method
 	// GetPodStatus(pod *kubecontainer.Pod) so that Docker can avoid listing
 	// all containers again.
 	status, err := g.runtime.GetPodStatus(pod.ID, pod.Name, pod.Namespace)
-	glog.V(8).Infof("PLEG: Write status for %s/%s: %+v (err: %v)", pod.Name, pod.Namespace, status, err)
+	klog.V(4).Infof("PLEG: Write status for %s/%s: %#v (err: %v)", pod.Name, pod.Namespace, status, err)
+	if err == nil {
+		// Preserve the pod IP across cache updates if the new IP is empty.
+		// When a pod is torn down, kubelet may race with PLEG and retrieve
+		// a pod status after network teardown, but the kubernetes API expects
+		// the completed pod's IP to be available after the pod is dead.
+		status.IPs = g.getPodIPs(pid, status)
+	}
+
 	g.cache.Set(pod.ID, status, err, timestamp)
 	return err
 }
@@ -281,11 +409,35 @@ func getContainerState(pod *kubecontainer.Pod, cid *kubecontainer.ContainerID) p
 	if pod == nil {
 		return state
 	}
-	container := pod.FindContainerByID(*cid)
-	if container == nil {
-		return state
+	c := pod.FindContainerByID(*cid)
+	if c != nil {
+		return convertState(c.State)
 	}
-	return convertState(container.State)
+	// Search through sandboxes too.
+	c = pod.FindSandboxByID(*cid)
+	if c != nil {
+		return convertState(c.State)
+	}
+
+	return state
+}
+
+func updateRunningPodAndContainerMetrics(pods []*kubecontainer.Pod) {
+	// Set the number of running pods in the parameter
+	metrics.RunningPodCount.Set(float64(len(pods)))
+	// intermediate map to store the count of each "container_state"
+	containerStateCount := make(map[string]int)
+
+	for _, pod := range pods {
+		containers := pod.Containers
+		for _, container := range containers {
+			// update the corresponding "container_state" in map to set value for the gaugeVec metrics
+			containerStateCount[string(container.State)]++
+		}
+	}
+	for key, value := range containerStateCount {
+		metrics.RunningContainerCount.WithLabelValues(key).Set(float64(value))
+	}
 }
 
 func (pr podRecords) getOld(id types.UID) *kubecontainer.Pod {
@@ -304,12 +456,17 @@ func (pr podRecords) getCurrent(id types.UID) *kubecontainer.Pod {
 	return r.current
 }
 
-func (pr podRecords) setCurrent(pod *kubecontainer.Pod) {
-	if r, ok := pr[pod.ID]; ok {
-		r.current = pod
-		return
+func (pr podRecords) setCurrent(pods []*kubecontainer.Pod) {
+	for i := range pr {
+		pr[i].current = nil
 	}
-	pr[pod.ID] = &podRecord{current: pod}
+	for _, pod := range pods {
+		if r, ok := pr[pod.ID]; ok {
+			r.current = pod
+		} else {
+			pr[pod.ID] = &podRecord{current: pod}
+		}
+	}
 }
 
 func (pr podRecords) update(id types.UID) {

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,12 +20,14 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/component-base/metrics"
+	"k8s.io/klog"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
-	"k8s.io/kubernetes/pkg/util/runtime"
 )
 
 // worker handles the periodic probing of its assigned container. Each worker has a go-routine
@@ -37,13 +39,13 @@ type worker struct {
 	stopCh chan struct{}
 
 	// The pod containing this probe (read-only)
-	pod *api.Pod
+	pod *v1.Pod
 
 	// The container to probe (read-only)
-	container api.Container
+	container v1.Container
 
 	// Describes the probe configuration (read-only)
-	spec *api.Probe
+	spec *v1.Probe
 
 	// The type of the worker.
 	probeType probeType
@@ -61,14 +63,23 @@ type worker struct {
 	lastResult results.Result
 	// How many times in a row the probe has returned the same result.
 	resultRun int
+
+	// If set, skip probing.
+	onHold bool
+
+	// proberResultsMetricLabels holds the labels attached to this worker
+	// for the ProberResults metric by result.
+	proberResultsSuccessfulMetricLabels metrics.Labels
+	proberResultsFailedMetricLabels     metrics.Labels
+	proberResultsUnknownMetricLabels    metrics.Labels
 }
 
 // Creates and starts a new probe worker.
 func newWorker(
 	m *manager,
 	probeType probeType,
-	pod *api.Pod,
-	container api.Container) *worker {
+	pod *v1.Pod,
+	container v1.Container) *worker {
 
 	w := &worker{
 		stopCh:       make(chan struct{}, 1), // Buffer so stop() can be non-blocking.
@@ -87,7 +98,28 @@ func newWorker(
 		w.spec = container.LivenessProbe
 		w.resultsManager = m.livenessManager
 		w.initialValue = results.Success
+	case startup:
+		w.spec = container.StartupProbe
+		w.resultsManager = m.startupManager
+		w.initialValue = results.Unknown
 	}
+
+	basicMetricLabels := metrics.Labels{
+		"probe_type": w.probeType.String(),
+		"container":  w.container.Name,
+		"pod":        w.pod.Name,
+		"namespace":  w.pod.Namespace,
+		"pod_uid":    string(w.pod.UID),
+	}
+
+	w.proberResultsSuccessfulMetricLabels = deepCopyPrometheusLabels(basicMetricLabels)
+	w.proberResultsSuccessfulMetricLabels["result"] = probeResultSuccessful
+
+	w.proberResultsFailedMetricLabels = deepCopyPrometheusLabels(basicMetricLabels)
+	w.proberResultsFailedMetricLabels["result"] = probeResultFailed
+
+	w.proberResultsUnknownMetricLabels = deepCopyPrometheusLabels(basicMetricLabels)
+	w.proberResultsUnknownMetricLabels["result"] = probeResultUnknown
 
 	return w
 }
@@ -95,6 +127,11 @@ func newWorker(
 // run periodically probes the container.
 func (w *worker) run() {
 	probeTickerPeriod := time.Duration(w.spec.PeriodSeconds) * time.Second
+
+	// If kubelet restarted the probes could be started in rapid succession.
+	// Let the worker wait for a random portion of tickerPeriod before probing.
+	time.Sleep(time.Duration(rand.Float64() * float64(probeTickerPeriod)))
+
 	probeTicker := time.NewTicker(probeTickerPeriod)
 
 	defer func() {
@@ -105,11 +142,10 @@ func (w *worker) run() {
 		}
 
 		w.probeManager.removeWorker(w.pod.UID, w.container.Name, w.probeType)
+		ProberResults.Delete(w.proberResultsSuccessfulMetricLabels)
+		ProberResults.Delete(w.proberResultsFailedMetricLabels)
+		ProberResults.Delete(w.proberResultsUnknownMetricLabels)
 	}()
-
-	// If kubelet restarted the probes could be started in rapid succession.
-	// Let the worker wait for a random portion of tickerPeriod before probing.
-	time.Sleep(time.Duration(rand.Float64() * float64(probeTickerPeriod)))
 
 probeLoop:
 	for w.doProbe() {
@@ -135,26 +171,27 @@ func (w *worker) stop() {
 // doProbe probes the container once and records the result.
 // Returns whether the worker should continue.
 func (w *worker) doProbe() (keepGoing bool) {
+	defer func() { recover() }() // Actually eat panics (HandleCrash takes care of logging)
 	defer runtime.HandleCrash(func(_ interface{}) { keepGoing = true })
 
 	status, ok := w.probeManager.statusManager.GetPodStatus(w.pod.UID)
 	if !ok {
 		// Either the pod has not been created yet, or it was already deleted.
-		glog.V(3).Infof("No status for pod: %v", format.Pod(w.pod))
+		klog.V(3).Infof("No status for pod: %v", format.Pod(w.pod))
 		return true
 	}
 
 	// Worker should terminate if pod is terminated.
-	if status.Phase == api.PodFailed || status.Phase == api.PodSucceeded {
-		glog.V(3).Infof("Pod %v %v, exiting probe worker",
+	if status.Phase == v1.PodFailed || status.Phase == v1.PodSucceeded {
+		klog.V(3).Infof("Pod %v %v, exiting probe worker",
 			format.Pod(w.pod), status.Phase)
 		return false
 	}
 
-	c, ok := api.GetContainerStatus(status.ContainerStatuses, w.container.Name)
-	if !ok {
+	c, ok := podutil.GetContainerStatus(status.ContainerStatuses, w.container.Name)
+	if !ok || len(c.ContainerID) == 0 {
 		// Either the container has not been created yet, or it was deleted.
-		glog.V(3).Infof("Non-existant container probed: %v - %v",
+		klog.V(3).Infof("Probe target container not found: %v - %v",
 			format.Pod(w.pod), w.container.Name)
 		return true // Wait for more information.
 	}
@@ -165,27 +202,59 @@ func (w *worker) doProbe() (keepGoing bool) {
 		}
 		w.containerID = kubecontainer.ParseContainerID(c.ContainerID)
 		w.resultsManager.Set(w.containerID, w.initialValue, w.pod)
+		// We've got a new container; resume probing.
+		w.onHold = false
+	}
+
+	if w.onHold {
+		// Worker is on hold until there is a new container.
+		return true
 	}
 
 	if c.State.Running == nil {
-		glog.V(3).Infof("Non-running container probed: %v - %v",
+		klog.V(3).Infof("Non-running container probed: %v - %v",
 			format.Pod(w.pod), w.container.Name)
 		if !w.containerID.IsEmpty() {
 			w.resultsManager.Set(w.containerID, results.Failure, w.pod)
 		}
 		// Abort if the container will not be restarted.
 		return c.State.Terminated == nil ||
-			w.pod.Spec.RestartPolicy != api.RestartPolicyNever
+			w.pod.Spec.RestartPolicy != v1.RestartPolicyNever
 	}
 
-	if int(time.Since(c.State.Running.StartedAt.Time).Seconds()) < w.spec.InitialDelaySeconds {
+	// Probe disabled for InitialDelaySeconds.
+	if int32(time.Since(c.State.Running.StartedAt.Time).Seconds()) < w.spec.InitialDelaySeconds {
 		return true
 	}
 
+	if c.Started != nil && *c.Started {
+		// Stop probing for startup once container has started.
+		if w.probeType == startup {
+			return true
+		}
+	} else {
+		// Disable other probes until container has started.
+		if w.probeType != startup {
+			return true
+		}
+	}
+
+	// TODO: in order for exec probes to correctly handle downward API env, we must be able to reconstruct
+	// the full container environment here, OR we must make a call to the CRI in order to get those environment
+	// values from the running container.
 	result, err := w.probeManager.prober.probe(w.probeType, w.pod, status, w.container, w.containerID)
 	if err != nil {
 		// Prober error, throw away the result.
 		return true
+	}
+
+	switch result {
+	case results.Success:
+		ProberResults.With(w.proberResultsSuccessfulMetricLabels).Inc()
+	case results.Failure:
+		ProberResults.With(w.proberResultsFailedMetricLabels).Inc()
+	default:
+		ProberResults.With(w.proberResultsUnknownMetricLabels).Inc()
 	}
 
 	if w.lastResult == result {
@@ -195,13 +264,30 @@ func (w *worker) doProbe() (keepGoing bool) {
 		w.resultRun = 1
 	}
 
-	if (result == results.Failure && w.resultRun < w.spec.FailureThreshold) ||
-		(result == results.Success && w.resultRun < w.spec.SuccessThreshold) {
+	if (result == results.Failure && w.resultRun < int(w.spec.FailureThreshold)) ||
+		(result == results.Success && w.resultRun < int(w.spec.SuccessThreshold)) {
 		// Success or failure is below threshold - leave the probe state unchanged.
 		return true
 	}
 
 	w.resultsManager.Set(w.containerID, result, w.pod)
 
+	if (w.probeType == liveness || w.probeType == startup) && result == results.Failure {
+		// The container fails a liveness/startup check, it will need to be restarted.
+		// Stop probing until we see a new container ID. This is to reduce the
+		// chance of hitting #21751, where running `docker exec` when a
+		// container is being stopped may lead to corrupted container state.
+		w.onHold = true
+		w.resultRun = 0
+	}
+
 	return true
+}
+
+func deepCopyPrometheusLabels(m metrics.Labels) metrics.Labels {
+	ret := make(metrics.Labels, len(m))
+	for k, v := range m {
+		ret[k] = v
+	}
+	return ret
 }

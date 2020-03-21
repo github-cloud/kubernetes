@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,70 +23,127 @@ import (
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
-	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
+	"k8s.io/utils/mount"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/record"
+	utiltesting "k8s.io/client-go/util/testing"
+	cadvisortest "k8s.io/kubernetes/pkg/kubelet/cadvisor/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/configmap"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/kubelet/network"
+	containertest "k8s.io/kubernetes/pkg/kubelet/container/testing"
+	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	kubepod "k8s.io/kubernetes/pkg/kubelet/pod"
+	podtest "k8s.io/kubernetes/pkg/kubelet/pod/testing"
+	"k8s.io/kubernetes/pkg/kubelet/secret"
+	"k8s.io/kubernetes/pkg/kubelet/server/stats"
 	"k8s.io/kubernetes/pkg/kubelet/status"
-	"k8s.io/kubernetes/pkg/util"
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
+	statustest "k8s.io/kubernetes/pkg/kubelet/status/testing"
+	"k8s.io/kubernetes/pkg/kubelet/volumemanager"
+	"k8s.io/kubernetes/pkg/volume"
+	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 )
 
 func TestRunOnce(t *testing.T) {
-	cadvisor := &cadvisor.Mock{}
+	cadvisor := &cadvisortest.Mock{}
 	cadvisor.On("MachineInfo").Return(&cadvisorapi.MachineInfo{}, nil)
-	cadvisor.On("DockerImagesFsInfo").Return(cadvisorapiv2.FsInfo{
-		Usage:     400 * mb,
-		Capacity:  1000 * mb,
-		Available: 600 * mb,
+	cadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{
+		Usage:     400,
+		Capacity:  1000,
+		Available: 600,
 	}, nil)
 	cadvisor.On("RootFsInfo").Return(cadvisorapiv2.FsInfo{
-		Usage:    9 * mb,
-		Capacity: 10 * mb,
+		Usage:    9,
+		Capacity: 10,
 	}, nil)
-	podManager := kubepod.NewBasicPodManager(kubepod.NewFakeMirrorClient())
-	diskSpaceManager, _ := newDiskSpaceManager(cadvisor, DiskSpacePolicy{})
-	fakeRuntime := &kubecontainer.FakeRuntime{}
+	fakeSecretManager := secret.NewFakeManager()
+	fakeConfigMapManager := configmap.NewFakeManager()
+	podManager := kubepod.NewBasicPodManager(
+		podtest.NewFakeMirrorClient(), fakeSecretManager, fakeConfigMapManager, podtest.NewMockCheckpointManager())
+	fakeRuntime := &containertest.FakeRuntime{}
 	basePath, err := utiltesting.MkTmpdir("kubelet")
 	if err != nil {
 		t.Fatalf("can't make a temp rootdir %v", err)
 	}
 	defer os.RemoveAll(basePath)
 	kb := &Kubelet{
-		rootDirectory:       basePath,
-		recorder:            &record.FakeRecorder{},
-		cadvisor:            cadvisor,
-		nodeLister:          testNodeLister{},
-		nodeInfo:            testNodeInfo{},
-		statusManager:       status.NewManager(nil, podManager),
-		containerRefManager: kubecontainer.NewRefManager(),
-		podManager:          podManager,
-		os:                  kubecontainer.FakeOS{},
-		volumeManager:       newVolumeManager(),
-		diskSpaceManager:    diskSpaceManager,
-		containerRuntime:    fakeRuntime,
-		reasonCache:         NewReasonCache(),
-		clock:               util.RealClock{},
+		rootDirectory:    basePath,
+		recorder:         &record.FakeRecorder{},
+		cadvisor:         cadvisor,
+		nodeLister:       testNodeLister{},
+		statusManager:    status.NewManager(nil, podManager, &statustest.FakePodDeletionSafetyProvider{}),
+		podManager:       podManager,
+		os:               &containertest.FakeOS{},
+		containerRuntime: fakeRuntime,
+		reasonCache:      NewReasonCache(),
+		clock:            clock.RealClock{},
+		kubeClient:       &fake.Clientset{},
+		hostname:         testKubeletHostname,
+		nodeName:         testKubeletHostname,
+		runtimeState:     newRuntimeState(time.Second),
+		hostutil:         hostutil.NewFakeHostUtil(nil),
 	}
 	kb.containerManager = cm.NewStubContainerManager()
 
-	kb.networkPlugin, _ = network.InitNetworkPlugin([]network.NetworkPlugin{}, "", network.NewFakeHost(nil))
+	plug := &volumetest.FakeVolumePlugin{PluginName: "fake", Host: nil}
+	kb.volumePluginMgr, err =
+		NewInitializedVolumePluginMgr(kb, fakeSecretManager, fakeConfigMapManager, nil, []volume.VolumePlugin{plug}, nil /* prober */)
+	if err != nil {
+		t.Fatalf("failed to initialize VolumePluginMgr: %v", err)
+	}
+	kb.volumeManager = volumemanager.NewVolumeManager(
+		true,
+		kb.nodeName,
+		kb.podManager,
+		kb.statusManager,
+		kb.kubeClient,
+		kb.volumePluginMgr,
+		fakeRuntime,
+		kb.mounter,
+		kb.hostutil,
+		kb.getPodsDir(),
+		kb.recorder,
+		false, /* experimentalCheckNodeCapabilitiesBeforeMount */
+		false, /* keepTerminatedPodVolumes */
+		volumetest.NewBlockVolumePathHandler())
+
+	// TODO: Factor out "StatsProvider" from Kubelet so we don't have a cyclic dependency
+	volumeStatsAggPeriod := time.Second * 10
+	kb.resourceAnalyzer = stats.NewResourceAnalyzer(kb, volumeStatsAggPeriod)
+	nodeRef := &v1.ObjectReference{
+		Kind:      "Node",
+		Name:      string(kb.nodeName),
+		UID:       types.UID(kb.nodeName),
+		Namespace: "",
+	}
+	fakeKillPodFunc := func(pod *v1.Pod, podStatus v1.PodStatus, gracePeriodOverride *int64) error {
+		return nil
+	}
+	fakeMirrodPodFunc := func(*v1.Pod) (*v1.Pod, bool) { return nil, false }
+	evictionManager, evictionAdmitHandler := eviction.NewManager(kb.resourceAnalyzer, eviction.Config{}, fakeKillPodFunc, fakeMirrodPodFunc, nil, nil, kb.recorder, nodeRef, kb.clock)
+
+	kb.evictionManager = evictionManager
+	kb.admitHandlers.AddPodAdmitHandler(evictionAdmitHandler)
+	kb.mounter = mount.NewFakeMounter(nil)
 	if err := kb.setupDataDirs(); err != nil {
 		t.Errorf("Failed to init data dirs: %v", err)
 	}
 
-	pods := []*api.Pod{
+	pods := []*v1.Pod{
 		{
-			ObjectMeta: api.ObjectMeta{
+			ObjectMeta: metav1.ObjectMeta{
 				UID:       "12345678",
 				Name:      "foo",
 				Namespace: "new",
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{
 					{Name: "bar"},
 				},
 			},
@@ -94,7 +151,7 @@ func TestRunOnce(t *testing.T) {
 	}
 	podManager.SetPods(pods)
 	// The original test here is totally meaningless, because fakeruntime will always return an empty podStatus. While
-	// the originial logic of isPodRunning happens to return true when podstatus is empty, so the test can always pass.
+	// the original logic of isPodRunning happens to return true when podstatus is empty, so the test can always pass.
 	// Now the logic in isPodRunning is changed, to let the test pass, we set the podstatus directly in fake runtime.
 	// This is also a meaningless test, because the isPodRunning will also always return true after setting this. However,
 	// because runonce is never used in kubernetes now, we should deprioritize the cleanup work.

@@ -1,7 +1,7 @@
 // +build linux
 
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,8 +24,9 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api/resource"
-	"k8s.io/kubernetes/pkg/util/exec"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/exec"
+	fakeexec "k8s.io/utils/exec/testing"
 )
 
 var tcClassOutput = `class htb 1:1 root prio 0 rate 10000bit ceil 10000bit burst 1600b cburst 1600b 
@@ -63,15 +64,15 @@ func TestNextClassID(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
-				func() ([]byte, error) { return []byte(test.output), test.err },
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeAction{
+				func() ([]byte, []byte, error) { return []byte(test.output), nil, test.err },
 			},
 		}
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
 				func(cmd string, args ...string) exec.Cmd {
-					return exec.InitFakeCmd(&fcmd, cmd, args...)
+					return fakeexec.InitFakeCmd(&fcmd, cmd, args...)
 				},
 			},
 		}
@@ -94,19 +95,33 @@ func TestNextClassID(t *testing.T) {
 
 func TestHexCIDR(t *testing.T) {
 	tests := []struct {
+		name      string
 		input     string
 		output    string
 		expectErr bool
 	}{
 		{
-			input:  "1.2.0.0/16",
+			name:   "IPv4 masked",
+			input:  "1.2.3.4/16",
 			output: "01020000/ffff0000",
 		},
 		{
+			name:   "IPv4 host",
 			input:  "172.17.0.2/32",
 			output: "ac110002/ffffffff",
 		},
 		{
+			name:   "IPv6 masked",
+			input:  "2001:dead:beef::cafe/64",
+			output: "2001deadbeef00000000000000000000/ffffffffffffffff0000000000000000",
+		},
+		{
+			name:   "IPv6 host",
+			input:  "2001::5/128",
+			output: "20010000000000000000000000000005/ffffffffffffffffffffffffffffffff",
+		},
+		{
+			name:      "invalid CIDR",
 			input:     "foo",
 			expectErr: true,
 		},
@@ -115,21 +130,76 @@ func TestHexCIDR(t *testing.T) {
 		output, err := hexCIDR(test.input)
 		if test.expectErr {
 			if err == nil {
-				t.Error("unexpected non-error")
+				t.Errorf("case %s: unexpected non-error", test.name)
 			}
 		} else {
 			if err != nil {
-				t.Errorf("unexpected error: %v", err)
+				t.Errorf("case %s: unexpected error: %v", test.name, err)
 			}
 			if output != test.output {
-				t.Errorf("expected: %s, saw: %s", test.output, output)
+				t.Errorf("case %s: expected: %s, saw: %s",
+					test.name, test.output, output)
 			}
-			input, err := asciiCIDR(output)
+		}
+	}
+}
+
+func TestAsciiCIDR(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		output    string
+		expectErr bool
+	}{
+		{
+			name:   "IPv4",
+			input:  "01020000/ffff0000",
+			output: "1.2.0.0/16",
+		},
+		{
+			name:   "IPv4 host",
+			input:  "ac110002/ffffffff",
+			output: "172.17.0.2/32",
+		},
+		{
+			name:   "IPv6",
+			input:  "2001deadbeef00000000000000000000/ffffffffffffffff0000000000000000",
+			output: "2001:dead:beef::/64",
+		},
+		{
+			name:   "IPv6 host",
+			input:  "20010000000000000000000000000005/ffffffffffffffffffffffffffffffff",
+			output: "2001::5/128",
+		},
+		{
+			name:      "invalid CIDR",
+			input:     "malformed",
+			expectErr: true,
+		},
+		{
+			name:      "non-hex IP",
+			input:     "nonhex/32",
+			expectErr: true,
+		},
+		{
+			name:      "non-hex mask",
+			input:     "01020000/badmask",
+			expectErr: true,
+		},
+	}
+	for _, test := range tests {
+		output, err := asciiCIDR(test.input)
+		if test.expectErr {
+			if err == nil {
+				t.Errorf("case %s: unexpected non-error", test.name)
+			}
+		} else {
 			if err != nil {
-				t.Errorf("unexpected error: %v", err)
+				t.Errorf("case %s: unexpected error: %v", test.name, err)
 			}
-			if input != test.input {
-				t.Errorf("expected: %s, saw: %s", test.input, input)
+			if output != test.output {
+				t.Errorf("case %s: expected: %s, saw: %s",
+					test.name, test.output, output)
 			}
 		}
 	}
@@ -140,6 +210,13 @@ filter parent 1: protocol ip pref 1 u32 fh 800: ht divisor 1
 filter parent 1: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1 
   match ac110002/ffffffff at 16
 filter parent 1: protocol ip pref 1 u32 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:2 
+  match 01020000/ffff0000 at 16
+`
+var tcFilterOutputNewVersion = `filter parent 1: protocol ip pref 1 u32
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800: ht divisor 1
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1 not_in_hw
+  match ac110002/ffffffff at 16
+filter parent 1: protocol ip pref 1 u32 chain 0 fh 800::801 order 2049 key ht 800 bkt 0 flowid 1:2 not_in_hw
   match 01020000/ffff0000 at 16
 `
 
@@ -171,25 +248,42 @@ func TestFindCIDRClass(t *testing.T) {
 			expectNotFound: true,
 		},
 		{
+			cidr:           "172.17.0.2/32",
+			output:         tcFilterOutputNewVersion,
+			expectedClass:  "1:1",
+			expectedHandle: "800::800",
+		},
+		{
+			cidr:           "1.2.3.4/16",
+			output:         tcFilterOutputNewVersion,
+			expectedClass:  "1:2",
+			expectedHandle: "800::801",
+		},
+		{
+			cidr:           "2.2.3.4/16",
+			output:         tcFilterOutputNewVersion,
+			expectNotFound: true,
+		},
+		{
 			err:       errors.New("test error"),
 			expectErr: true,
 		},
 	}
 	for _, test := range tests {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
-				func() ([]byte, error) { return []byte(test.output), test.err },
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeAction{
+				func() ([]byte, []byte, error) { return []byte(test.output), nil, test.err },
 			},
 		}
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
 				func(cmd string, args ...string) exec.Cmd {
-					return exec.InitFakeCmd(&fcmd, cmd, args...)
+					return fakeexec.InitFakeCmd(&fcmd, cmd, args...)
 				},
 			},
 		}
 		shaper := &tcShaper{e: &fexec}
-		class, handle, found, err := shaper.findCIDRClass(test.cidr)
+		classAndHandle, found, err := shaper.findCIDRClass(test.cidr)
 		if test.expectErr {
 			if err == nil {
 				t.Errorf("unexpected non-error")
@@ -200,14 +294,14 @@ func TestFindCIDRClass(t *testing.T) {
 			}
 			if test.expectNotFound {
 				if found {
-					t.Errorf("unexpectedly found an interface: %s %s", class, handle)
+					t.Errorf("unexpectedly found an interface: %s", classAndHandle)
 				}
 			} else {
-				if class != test.expectedClass {
-					t.Errorf("expected: %s, found %s", test.expectedClass, class)
+				if classAndHandle[0][0] != test.expectedClass {
+					t.Errorf("expected class: %s, found %s", test.expectedClass, classAndHandle)
 				}
-				if handle != test.expectedHandle {
-					t.Errorf("expected: %s, found %s", test.expectedHandle, handle)
+				if classAndHandle[0][1] != test.expectedHandle {
+					t.Errorf("expected handle: %s, found %s", test.expectedHandle, classAndHandle)
 				}
 			}
 		}
@@ -215,15 +309,15 @@ func TestFindCIDRClass(t *testing.T) {
 }
 
 func TestGetCIDRs(t *testing.T) {
-	fcmd := exec.FakeCmd{
-		CombinedOutputScript: []exec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte(tcFilterOutput), nil },
+	fcmd := fakeexec.FakeCmd{
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return []byte(tcFilterOutput), nil, nil },
 		},
 	}
-	fexec := exec.FakeExec{
-		CommandScript: []exec.FakeCommandAction{
+	fexec := fakeexec.FakeExec{
+		CommandScript: []fakeexec.FakeCommandAction{
 			func(cmd string, args ...string) exec.Cmd {
-				return exec.InitFakeCmd(&fcmd, cmd, args...)
+				return fakeexec.InitFakeCmd(&fcmd, cmd, args...)
 			},
 		},
 	}
@@ -280,25 +374,25 @@ func TestLimit(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
-				func() ([]byte, error) { return []byte(tcClassOutput), test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
-				func() ([]byte, error) { return []byte(tcClassOutput2), test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeAction{
+				func() ([]byte, []byte, error) { return []byte(tcClassOutput), nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
+				func() ([]byte, []byte, error) { return []byte(tcClassOutput2), nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
 			},
 		}
 
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 			},
 		}
 		iface := "cbr0"
@@ -396,19 +490,19 @@ func TestReset(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
-				func() ([]byte, error) { return []byte(tcFilterOutput), test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
-				func() ([]byte, error) { return []byte{}, test.err },
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeAction{
+				func() ([]byte, []byte, error) { return []byte(tcFilterOutput), nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
+				func() ([]byte, []byte, error) { return []byte{}, nil, test.err },
 			},
 		}
 
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 			},
 		}
 		iface := "cbr0"
@@ -455,15 +549,15 @@ func TestReset(t *testing.T) {
 var tcQdisc = "qdisc htb 1: root refcnt 2 r2q 10 default 30 direct_packets_stat 0\n"
 
 func TestReconcileInterfaceExists(t *testing.T) {
-	fcmd := exec.FakeCmd{
-		CombinedOutputScript: []exec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte(tcQdisc), nil },
+	fcmd := fakeexec.FakeCmd{
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return []byte(tcQdisc), nil, nil },
 		},
 	}
 
-	fexec := exec.FakeExec{
-		CommandScript: []exec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
+	fexec := fakeexec.FakeExec{
+		CommandScript: []fakeexec.FakeCommandAction{
+			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 		},
 	}
 	iface := "cbr0"
@@ -493,17 +587,17 @@ func TestReconcileInterfaceExists(t *testing.T) {
 }
 
 func testReconcileInterfaceHasNoData(t *testing.T, output string) {
-	fcmd := exec.FakeCmd{
-		CombinedOutputScript: []exec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte(output), nil },
-			func() ([]byte, error) { return []byte(output), nil },
+	fcmd := fakeexec.FakeCmd{
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return []byte(output), nil, nil },
+			func() ([]byte, []byte, error) { return []byte(output), nil, nil },
 		},
 	}
 
-	fexec := exec.FakeExec{
-		CommandScript: []exec.FakeCommandAction{
-			func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-			func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
+	fexec := fakeexec.FakeExec{
+		CommandScript: []fakeexec.FakeCommandAction{
+			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 		},
 	}
 	iface := "cbr0"
@@ -566,19 +660,19 @@ var tcQdiscWrong = []string{
 
 func TestReconcileInterfaceIsWrong(t *testing.T) {
 	for _, test := range tcQdiscWrong {
-		fcmd := exec.FakeCmd{
-			CombinedOutputScript: []exec.FakeCombinedOutputAction{
-				func() ([]byte, error) { return []byte(test), nil },
-				func() ([]byte, error) { return []byte("\n"), nil },
-				func() ([]byte, error) { return []byte("\n"), nil },
+		fcmd := fakeexec.FakeCmd{
+			CombinedOutputScript: []fakeexec.FakeAction{
+				func() ([]byte, []byte, error) { return []byte(test), nil, nil },
+				func() ([]byte, []byte, error) { return []byte("\n"), nil, nil },
+				func() ([]byte, []byte, error) { return []byte("\n"), nil, nil },
 			},
 		}
 
-		fexec := exec.FakeExec{
-			CommandScript: []exec.FakeCommandAction{
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
-				func(cmd string, args ...string) exec.Cmd { return exec.InitFakeCmd(&fcmd, cmd, args...) },
+		fexec := fakeexec.FakeExec{
+			CommandScript: []fakeexec.FakeCommandAction{
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
+				func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 			},
 		}
 		iface := "cbr0"

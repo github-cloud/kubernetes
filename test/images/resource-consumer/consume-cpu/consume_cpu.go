@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ func main() {
 	duration := time.Duration(*durationSec) * time.Second
 	start := time.Now()
 	first := systemstat.GetProcCPUSample()
-	for time.Now().Sub(start) < duration {
+	for time.Since(start) < duration {
 		cpu := systemstat.GetProcCPUAverage(first, systemstat.GetProcCPUSample(), systemstat.GetUptime().Uptime)
 		if cpu.TotalPct < millicoresPct {
 			doSomething()

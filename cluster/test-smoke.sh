@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,10 +23,8 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-
-TEST_ARGS="$@"
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 
 SMOKE_TEST_FOCUS_REGEX="Guestbook.application"
 
-exec "${KUBE_ROOT}/cluster/test-e2e.sh" -ginkgo.focus="${SMOKE_TEST_FOCUS_REGEX}" ${TEST_ARGS}
+exec "${KUBE_ROOT}/cluster/test-e2e.sh" -ginkgo.focus="${SMOKE_TEST_FOCUS_REGEX}" "$@"

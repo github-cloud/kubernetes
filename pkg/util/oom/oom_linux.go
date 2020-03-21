@@ -1,7 +1,7 @@
-// +build cgo,linux
+// +build linux
 
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,11 +23,13 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
+	"time"
 
-	"github.com/golang/glog"
-	"github.com/opencontainers/runc/libcontainer/cgroups/fs"
-	"github.com/opencontainers/runc/libcontainer/configs"
+	cmutil "k8s.io/kubernetes/pkg/kubelet/cm/util"
+
+	"k8s.io/klog"
 )
 
 func NewOOMAdjuster() *OOMAdjuster {
@@ -40,23 +42,7 @@ func NewOOMAdjuster() *OOMAdjuster {
 }
 
 func getPids(cgroupName string) ([]int, error) {
-	fsManager := fs.Manager{
-		Cgroups: &configs.Cgroup{
-			Parent: "/",
-			Name:   cgroupName,
-		},
-	}
-	return fsManager.GetPids()
-}
-
-func syscallNotExists(err error) bool {
-	if err == nil {
-		return false
-	}
-	if e, ok := err.(*os.SyscallError); ok && os.IsNotExist(e) {
-		return true
-	}
-	return false
+	return cmutil.GetPids(filepath.Join("/", cgroupName))
 }
 
 // Writes 'value' to /proc/<pid>/oom_score_adj. PID = 0 means self
@@ -76,14 +62,24 @@ func applyOOMScoreAdj(pid int, oomScoreAdj int) error {
 	maxTries := 2
 	oomScoreAdjPath := path.Join("/proc", pidStr, "oom_score_adj")
 	value := strconv.Itoa(oomScoreAdj)
+	klog.V(4).Infof("attempting to set %q to %q", oomScoreAdjPath, value)
 	var err error
 	for i := 0; i < maxTries; i++ {
-		if err = ioutil.WriteFile(oomScoreAdjPath, []byte(value), 0700); err != nil {
-			if syscallNotExists(err) {
+		err = ioutil.WriteFile(oomScoreAdjPath, []byte(value), 0700)
+		if err != nil {
+			if os.IsNotExist(err) {
+				klog.V(2).Infof("%q does not exist", oomScoreAdjPath)
 				return os.ErrNotExist
 			}
-			err = fmt.Errorf("failed to apply oom-score-adj to pid %d (%v)", err)
+
+			klog.V(3).Info(err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+		return nil
+	}
+	if err != nil {
+		klog.V(2).Infof("failed to set %q to %q: %v", oomScoreAdjPath, value, err)
 	}
 	return err
 }
@@ -96,20 +92,26 @@ func (oomAdjuster *OOMAdjuster) applyOOMScoreAdjContainer(cgroupName string, oom
 		continueAdjusting := false
 		pidList, err := oomAdjuster.pidLister(cgroupName)
 		if err != nil {
-			if syscallNotExists(err) {
+			if os.IsNotExist(err) {
 				// Nothing to do since the container doesn't exist anymore.
 				return os.ErrNotExist
 			}
 			continueAdjusting = true
-			glog.Errorf("Error getting process list for cgroup %s: %+v", cgroupName, err)
+			klog.V(10).Infof("Error getting process list for cgroup %s: %+v", cgroupName, err)
 		} else if len(pidList) == 0 {
+			klog.V(10).Infof("Pid list is empty")
 			continueAdjusting = true
 		} else {
 			for _, pid := range pidList {
 				if !adjustedProcessSet[pid] {
-					continueAdjusting = true
+					klog.V(10).Infof("pid %d needs to be set", pid)
 					if err = oomAdjuster.ApplyOOMScoreAdj(pid, oomScoreAdj); err == nil {
 						adjustedProcessSet[pid] = true
+					} else if err == os.ErrNotExist {
+						continue
+					} else {
+						klog.V(10).Infof("cannot adjust oom score for pid %d - %v", pid, err)
+						continueAdjusting = true
 					}
 					// Processes can come and go while we try to apply oom score adjust value. So ignore errors here.
 				}

@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,8 @@ package results
 import (
 	"sync"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
@@ -29,7 +30,7 @@ type Manager interface {
 	Get(kubecontainer.ContainerID) (Result, bool)
 	// Set sets the cached result for the container with the given ID.
 	// The pod is only included to be sent with the update.
-	Set(kubecontainer.ContainerID, Result, *api.Pod)
+	Set(kubecontainer.ContainerID, Result, *v1.Pod)
 	// Remove clears the cached result for the container with the given ID.
 	Remove(kubecontainer.ContainerID)
 	// Updates creates a channel that receives an Update whenever its result changes (but not
@@ -39,11 +40,17 @@ type Manager interface {
 }
 
 // Result is the type for probe results.
-type Result bool
+type Result int
 
 const (
-	Success Result = true
-	Failure Result = false
+	// Unknown is encoded as -1 (type Result)
+	Unknown Result = iota - 1
+
+	// Success is encoded as 0 (type Result)
+	Success
+
+	// Failure is encoded as 1 (type Result)
+	Failure
 )
 
 func (r Result) String() string {
@@ -57,11 +64,23 @@ func (r Result) String() string {
 	}
 }
 
+// ToPrometheusType translates a Result to a form which is better understood by prometheus.
+func (r Result) ToPrometheusType() float64 {
+	switch r {
+	case Success:
+		return 0
+	case Failure:
+		return 1
+	default:
+		return -1
+	}
+}
+
 // Update is an enum of the types of updates sent over the Updates channel.
 type Update struct {
 	ContainerID kubecontainer.ContainerID
 	Result      Result
-	Pod         *api.Pod
+	PodUID      types.UID
 }
 
 // Manager implementation.
@@ -76,7 +95,7 @@ type manager struct {
 
 var _ Manager = &manager{}
 
-// NewManager creates ane returns an empty results manager.
+// NewManager creates and returns an empty results manager.
 func NewManager() Manager {
 	return &manager{
 		cache:   make(map[kubecontainer.ContainerID]Result),
@@ -91,9 +110,9 @@ func (m *manager) Get(id kubecontainer.ContainerID) (Result, bool) {
 	return result, found
 }
 
-func (m *manager) Set(id kubecontainer.ContainerID, result Result, pod *api.Pod) {
+func (m *manager) Set(id kubecontainer.ContainerID, result Result, pod *v1.Pod) {
 	if m.setInternal(id, result) {
-		m.updates <- Update{id, result, pod}
+		m.updates <- Update{id, result, pod.UID}
 	}
 }
 

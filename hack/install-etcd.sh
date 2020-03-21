@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,15 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script is convenience to download and install etcd in third_party.
+# Mostly just used by CI.
+# Usage: `hack/install-etcd.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+source "${KUBE_ROOT}/hack/lib/init.sh"
 
-ETCD_VERSION=${ETCD_VERSION:-v2.2.1}
-
-cd "${KUBE_ROOT}/third_party"
-curl -fsSL https://github.com/coreos/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz \
-  | tar xzf -
-ln -fns etcd-${ETCD_VERSION}-linux-amd64 etcd
+kube::etcd::install

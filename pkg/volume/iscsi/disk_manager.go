@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,40 +19,41 @@ package iscsi
 import (
 	"os"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/util/mount"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog"
+	"k8s.io/utils/mount"
+
 	"k8s.io/kubernetes/pkg/volume"
+	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 // Abstract interface to disk operations.
 type diskManager interface {
 	MakeGlobalPDName(disk iscsiDisk) string
+	MakeGlobalVDPDName(disk iscsiDisk) string
 	// Attaches the disk to the kubelet's host machine.
-	AttachDisk(b iscsiDiskBuilder) error
+	AttachDisk(b iscsiDiskMounter) (string, error)
 	// Detaches the disk from the kubelet's host machine.
-	DetachDisk(disk iscsiDiskCleaner, mntPath string) error
+	DetachDisk(disk iscsiDiskUnmounter, mntPath string) error
+	// Detaches the block disk from the kubelet's host machine.
+	DetachBlockISCSIDisk(disk iscsiDiskUnmapper, mntPath string) error
 }
 
 // utility to mount a disk based filesystem
-func diskSetUp(manager diskManager, b iscsiDiskBuilder, volPath string, mounter mount.Interface, fsGroup *int64) error {
-	globalPDPath := manager.MakeGlobalPDName(*b.iscsiDisk)
-	// TODO: handle failed mounts here.
+// globalPDPath: global mount path like, /var/lib/kubelet/plugins/kubernetes.io/iscsi/{ifaceName}/{portal-some_iqn-lun-lun_id}
+// volPath: pod volume dir path like, /var/lib/kubelet/pods/{podUID}/volumes/kubernetes.io~iscsi/{volumeName}
+func diskSetUp(manager diskManager, b iscsiDiskMounter, volPath string, mounter mount.Interface, fsGroup *int64, fsGroupChangePolicy *v1.PodFSGroupChangePolicy) error {
 	notMnt, err := mounter.IsLikelyNotMountPoint(volPath)
-
 	if err != nil && !os.IsNotExist(err) {
-		glog.Errorf("cannot validate mountpoint: %s", volPath)
+		klog.Errorf("cannot validate mountpoint: %s", volPath)
 		return err
 	}
 	if !notMnt {
 		return nil
 	}
-	if err := manager.AttachDisk(b); err != nil {
-		glog.Errorf("failed to attach disk")
-		return err
-	}
 
 	if err := os.MkdirAll(volPath, 0750); err != nil {
-		glog.Errorf("failed to mkdir:%s", volPath)
+		klog.Errorf("failed to mkdir:%s", volPath)
 		return err
 	}
 	// Perform a bind mount to the full path to allow duplicate mounts of the same disk.
@@ -60,59 +61,43 @@ func diskSetUp(manager diskManager, b iscsiDiskBuilder, volPath string, mounter 
 	if b.readOnly {
 		options = append(options, "ro")
 	}
-	err = mounter.Mount(globalPDPath, volPath, "", options)
+	if b.iscsiDisk.InitiatorName != "" {
+		// new iface name is <target portal>:<volume name>
+		b.iscsiDisk.Iface = b.iscsiDisk.Portals[0] + ":" + b.iscsiDisk.VolName
+	}
+	globalPDPath := manager.MakeGlobalPDName(*b.iscsiDisk)
+	mountOptions := util.JoinMountOptions(b.mountOptions, options)
+	err = mounter.Mount(globalPDPath, volPath, "", mountOptions)
 	if err != nil {
-		glog.Errorf("failed to bind mount:%s", globalPDPath)
+		klog.Errorf("Failed to bind mount: source:%s, target:%s, err:%v", globalPDPath, volPath, err)
+		noMnt, mntErr := b.mounter.IsLikelyNotMountPoint(volPath)
+		if mntErr != nil {
+			klog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
+			return err
+		}
+		if !noMnt {
+			if mntErr = b.mounter.Unmount(volPath); mntErr != nil {
+				klog.Errorf("Failed to unmount: %v", mntErr)
+				return err
+			}
+			noMnt, mntErr = b.mounter.IsLikelyNotMountPoint(volPath)
+			if mntErr != nil {
+				klog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
+				return err
+			}
+			if !noMnt {
+				//  will most likely retry on next sync loop.
+				klog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", volPath)
+				return err
+			}
+		}
+		os.Remove(volPath)
 		return err
 	}
 
 	if !b.readOnly {
-		volume.SetVolumeOwnership(&b, fsGroup)
+		volume.SetVolumeOwnership(&b, fsGroup, fsGroupChangePolicy)
 	}
 
 	return nil
-}
-
-// utility to tear down a disk based filesystem
-func diskTearDown(manager diskManager, c iscsiDiskCleaner, volPath string, mounter mount.Interface) error {
-	notMnt, err := mounter.IsLikelyNotMountPoint(volPath)
-	if err != nil {
-		glog.Errorf("cannot validate mountpoint %s", volPath)
-		return err
-	}
-	if notMnt {
-		return os.Remove(volPath)
-	}
-
-	refs, err := mount.GetMountRefs(mounter, volPath)
-	if err != nil {
-		glog.Errorf("failed to get reference count %s", volPath)
-		return err
-	}
-	if err := mounter.Unmount(volPath); err != nil {
-		glog.Errorf("failed to unmount %s", volPath)
-		return err
-	}
-	// If len(refs) is 1, then all bind mounts have been removed, and the
-	// remaining reference is the global mount. It is safe to detach.
-	if len(refs) == 1 {
-		mntPath := refs[0]
-		if err := manager.DetachDisk(c, mntPath); err != nil {
-			glog.Errorf("failed to detach disk from %s", mntPath)
-			return err
-		}
-	}
-
-	notMnt, mntErr := mounter.IsLikelyNotMountPoint(volPath)
-	if mntErr != nil {
-		glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
-		return err
-	}
-	if notMnt {
-		if err := os.Remove(volPath); err != nil {
-			return err
-		}
-	}
-	return nil
-
 }

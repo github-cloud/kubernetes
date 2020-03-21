@@ -1,7 +1,7 @@
 // +build linux
 
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,36 +19,19 @@ limitations under the License.
 package cm
 
 import (
-	"fmt"
+	"io/ioutil"
+	"os"
+	"path"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/utils/mount"
 )
 
-type fakeMountInterface struct {
-	mountPoints []mount.MountPoint
-}
-
-func (mi *fakeMountInterface) Mount(source string, target string, fstype string, options []string) error {
-	return fmt.Errorf("unsupported")
-}
-
-func (mi *fakeMountInterface) Unmount(target string) error {
-	return fmt.Errorf("unsupported")
-}
-
-func (mi *fakeMountInterface) List() ([]mount.MountPoint, error) {
-	return mi.mountPoints, nil
-}
-
-func (mi *fakeMountInterface) IsLikelyNotMountPoint(file string) (bool, error) {
-	return false, fmt.Errorf("unsupported")
-}
-
 func fakeContainerMgrMountInt() mount.Interface {
-	return &fakeMountInterface{
+	return mount.NewFakeMounter(
 		[]mount.MountPoint{
 			{
 				Device: "cgroup",
@@ -70,16 +53,17 @@ func fakeContainerMgrMountInt() mount.Interface {
 				Type:   "cgroup",
 				Opts:   []string{"rw", "relatime", "memory"},
 			},
-		},
-	}
+		})
 }
 
 func TestCgroupMountValidationSuccess(t *testing.T) {
-	assert.Nil(t, validateSystemRequirements(fakeContainerMgrMountInt()))
+	f, err := validateSystemRequirements(fakeContainerMgrMountInt())
+	assert.Nil(t, err)
+	assert.False(t, f.cpuHardcapping, "cpu hardcapping is expected to be disabled")
 }
 
 func TestCgroupMountValidationMemoryMissing(t *testing.T) {
-	mountInt := &fakeMountInterface{
+	mountInt := mount.NewFakeMounter(
 		[]mount.MountPoint{
 			{
 				Device: "cgroup",
@@ -96,13 +80,13 @@ func TestCgroupMountValidationMemoryMissing(t *testing.T) {
 				Type:   "cgroup",
 				Opts:   []string{"rw", "relatime", "cpuacct"},
 			},
-		},
-	}
-	assert.Error(t, validateSystemRequirements(mountInt))
+		})
+	_, err := validateSystemRequirements(mountInt)
+	assert.Error(t, err)
 }
 
-func TestCgroupMountValidationMultipleSubsytem(t *testing.T) {
-	mountInt := &fakeMountInterface{
+func TestCgroupMountValidationMultipleSubsystem(t *testing.T) {
+	mountInt := mount.NewFakeMounter(
 		[]mount.MountPoint{
 			{
 				Device: "cgroup",
@@ -119,7 +103,38 @@ func TestCgroupMountValidationMultipleSubsytem(t *testing.T) {
 				Type:   "cgroup",
 				Opts:   []string{"rw", "relatime", "cpuacct"},
 			},
-		},
-	}
-	assert.Nil(t, validateSystemRequirements(mountInt))
+		})
+	_, err := validateSystemRequirements(mountInt)
+	assert.Nil(t, err)
+}
+
+func TestSoftRequirementsValidationSuccess(t *testing.T) {
+	req := require.New(t)
+	tempDir, err := ioutil.TempDir("", "")
+	req.NoError(err)
+	defer os.RemoveAll(tempDir)
+	req.NoError(ioutil.WriteFile(path.Join(tempDir, "cpu.cfs_period_us"), []byte("0"), os.ModePerm))
+	req.NoError(ioutil.WriteFile(path.Join(tempDir, "cpu.cfs_quota_us"), []byte("0"), os.ModePerm))
+	mountInt := mount.NewFakeMounter(
+		[]mount.MountPoint{
+			{
+				Device: "cgroup",
+				Type:   "cgroup",
+				Opts:   []string{"rw", "relatime", "cpuset"},
+			},
+			{
+				Device: "cgroup",
+				Type:   "cgroup",
+				Opts:   []string{"rw", "relatime", "cpu"},
+				Path:   tempDir,
+			},
+			{
+				Device: "cgroup",
+				Type:   "cgroup",
+				Opts:   []string{"rw", "relatime", "cpuacct", "memory"},
+			},
+		})
+	f, err := validateSystemRequirements(mountInt)
+	assert.NoError(t, err)
+	assert.True(t, f.cpuHardcapping, "cpu hardcapping is expected to be enabled")
 }

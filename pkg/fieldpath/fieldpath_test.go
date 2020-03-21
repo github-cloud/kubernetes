@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestExtractFieldPathAsString(t *testing.T) {
@@ -32,16 +33,16 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		expectedMessageFragment string
 	}{
 		{
-			name:      "not an API object",
-			fieldPath: "metadata.name",
-			obj:       "",
-			expectedMessageFragment: "expected struct",
+			name:                    "not an API object",
+			fieldPath:               "metadata.name",
+			obj:                     "",
+			expectedMessageFragment: "object does not implement the Object interfaces",
 		},
 		{
 			name:      "ok - namespace",
 			fieldPath: "metadata.namespace",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "object-namespace",
 				},
 			},
@@ -50,8 +51,8 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		{
 			name:      "ok - name",
 			fieldPath: "metadata.name",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Name: "object-name",
 				},
 			},
@@ -60,43 +61,110 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		{
 			name:      "ok - labels",
 			fieldPath: "metadata.labels",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"key": "value"},
 				},
 			},
-			expectedValue: "key=\"value\"\n",
+			expectedValue: "key=\"value\"",
 		},
 		{
 			name:      "ok - labels bslash n",
 			fieldPath: "metadata.labels",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"key": "value\n"},
 				},
 			},
-			expectedValue: "key=\"value\\n\"\n",
+			expectedValue: "key=\"value\\n\"",
 		},
 		{
 			name:      "ok - annotations",
 			fieldPath: "metadata.annotations",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{"builder": "john-doe"},
 				},
 			},
-			expectedValue: "builder=\"john-doe\"\n",
+			expectedValue: "builder=\"john-doe\"",
 		},
-
+		{
+			name:      "ok - annotation",
+			fieldPath: "metadata.annotations['spec.pod.beta.kubernetes.io/statefulset-index']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"spec.pod.beta.kubernetes.io/statefulset-index": "1"},
+				},
+			},
+			expectedValue: "1",
+		},
+		{
+			name:      "ok - annotation",
+			fieldPath: "metadata.annotations['Www.k8s.io/test']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"Www.k8s.io/test": "1"},
+				},
+			},
+			expectedValue: "1",
+		},
+		{
+			name:      "ok - uid",
+			fieldPath: "metadata.uid",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: "b70b3269-858e-12a8-9cf2-1232a194038a",
+				},
+			},
+			expectedValue: "b70b3269-858e-12a8-9cf2-1232a194038a",
+		},
+		{
+			name:      "ok - label",
+			fieldPath: "metadata.labels['something']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"something": "label value",
+					},
+				},
+			},
+			expectedValue: "label value",
+		},
 		{
 			name:      "invalid expression",
 			fieldPath: "metadata.whoops",
-			obj: &api.Pod{
-				ObjectMeta: api.ObjectMeta{
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "object-namespace",
 				},
 			},
-			expectedMessageFragment: "Unsupported fieldPath",
+			expectedMessageFragment: "unsupported fieldPath",
+		},
+		{
+			name:      "invalid annotation key",
+			fieldPath: "metadata.annotations['invalid~key']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"foo": "bar"},
+				},
+			},
+			expectedMessageFragment: "invalid key subscript in metadata.annotations",
+		},
+		{
+			name:      "invalid label key",
+			fieldPath: "metadata.labels['Www.k8s.io/test']",
+			obj: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"foo": "bar"},
+				},
+			},
+			expectedMessageFragment: "invalid key subscript in metadata.labels",
+		},
+		{
+			name:                    "invalid subscript",
+			fieldPath:               "metadata.notexisting['something']",
+			obj:                     &v1.Pod{},
+			expectedMessageFragment: "fieldPath \"metadata.notexisting['something']\" does not support subscript",
 		},
 	}
 
@@ -105,13 +173,98 @@ func TestExtractFieldPathAsString(t *testing.T) {
 		if err != nil {
 			if tc.expectedMessageFragment != "" {
 				if !strings.Contains(err.Error(), tc.expectedMessageFragment) {
-					t.Errorf("%v: Unexpected error message: %q, expected to contain %q", tc.name, err, tc.expectedMessageFragment)
+					t.Errorf("%v: unexpected error message: %q, expected to contain %q", tc.name, err, tc.expectedMessageFragment)
 				}
 			} else {
 				t.Errorf("%v: unexpected error: %v", tc.name, err)
 			}
+		} else if tc.expectedMessageFragment != "" {
+			t.Errorf("%v: expected error: %v", tc.name, tc.expectedMessageFragment)
 		} else if e := tc.expectedValue; e != "" && e != actual {
-			t.Errorf("%v: Unexpected result; got %q, expected %q", tc.name, actual, e)
+			t.Errorf("%v: unexpected result; got %q, expected %q", tc.name, actual, e)
+		}
+	}
+}
+
+func TestSplitMaybeSubscriptedPath(t *testing.T) {
+	cases := []struct {
+		fieldPath         string
+		expectedPath      string
+		expectedSubscript string
+		expectedOK        bool
+	}{
+		{
+			fieldPath:         "metadata.annotations['key']",
+			expectedPath:      "metadata.annotations",
+			expectedSubscript: "key",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:         "metadata.annotations['a[b']c']",
+			expectedPath:      "metadata.annotations",
+			expectedSubscript: "a[b']c",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:         "metadata.labels['['key']",
+			expectedPath:      "metadata.labels",
+			expectedSubscript: "['key",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:         "metadata.labels['key']']",
+			expectedPath:      "metadata.labels",
+			expectedSubscript: "key']",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:         "metadata.labels['']",
+			expectedPath:      "metadata.labels",
+			expectedSubscript: "",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:         "metadata.labels[' ']",
+			expectedPath:      "metadata.labels",
+			expectedSubscript: " ",
+			expectedOK:        true,
+		},
+		{
+			fieldPath:  "metadata.labels[ 'key' ]",
+			expectedOK: false,
+		},
+		{
+			fieldPath:  "metadata.labels[]",
+			expectedOK: false,
+		},
+		{
+			fieldPath:  "metadata.labels[']",
+			expectedOK: false,
+		},
+		{
+			fieldPath:  "metadata.labels['key']foo",
+			expectedOK: false,
+		},
+		{
+			fieldPath:  "['key']",
+			expectedOK: false,
+		},
+		{
+			fieldPath:  "metadata.labels",
+			expectedOK: false,
+		},
+	}
+	for _, tc := range cases {
+		path, subscript, ok := SplitMaybeSubscriptedPath(tc.fieldPath)
+		if !ok {
+			if tc.expectedOK {
+				t.Errorf("SplitMaybeSubscriptedPath(%q) expected to return (_, _, true)", tc.fieldPath)
+			}
+			continue
+		}
+		if path != tc.expectedPath || subscript != tc.expectedSubscript {
+			t.Errorf("SplitMaybeSubscriptedPath(%q) = (%q, %q, true), expect (%q, %q, true)",
+				tc.fieldPath, path, subscript, tc.expectedPath, tc.expectedSubscript)
 		}
 	}
 }

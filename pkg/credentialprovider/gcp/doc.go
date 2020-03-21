@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package gcp_credentials contains  implementations of DockerConfigProvider
+// Package gcp contains implementations of DockerConfigProvider
 // for Google Cloud Platform.
-package gcp_credentials
+package gcp // import "k8s.io/kubernetes/pkg/credentialprovider/gcp"

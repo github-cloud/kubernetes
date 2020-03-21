@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package exec
 
 import (
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 
 	"k8s.io/kubernetes/pkg/probe"
@@ -27,6 +29,11 @@ type FakeCmd struct {
 	out    []byte
 	stdout []byte
 	err    error
+	writer io.Writer
+}
+
+func (f *FakeCmd) Run() error {
+	return nil
 }
 
 func (f *FakeCmd) CombinedOutput() ([]byte, error) {
@@ -38,6 +45,38 @@ func (f *FakeCmd) Output() ([]byte, error) {
 }
 
 func (f *FakeCmd) SetDir(dir string) {}
+
+func (f *FakeCmd) SetStdin(in io.Reader) {}
+
+func (f *FakeCmd) SetStdout(out io.Writer) {
+	f.writer = out
+}
+
+func (f *FakeCmd) SetStderr(out io.Writer) {
+	f.writer = out
+}
+
+func (f *FakeCmd) SetEnv(env []string) {}
+
+func (f *FakeCmd) Stop() {}
+
+func (f *FakeCmd) Start() error {
+	if f.writer != nil {
+		f.writer.Write(f.out)
+		return f.err
+	}
+	return f.err
+}
+
+func (f *FakeCmd) Wait() error { return nil }
+
+func (f *FakeCmd) StdoutPipe() (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (f *FakeCmd) StderrPipe() (io.ReadCloser, error) {
+	return nil, nil
+}
 
 type fakeExitError struct {
 	exited     bool
@@ -63,20 +102,26 @@ func (f *fakeExitError) ExitStatus() int {
 func TestExec(t *testing.T) {
 	prober := New()
 
+	tenKilobyte := strings.Repeat("logs-123", 128*10)      // 8*128*10=10240 = 10KB of text.
+	elevenKilobyte := strings.Repeat("logs-123", 8*128*11) // 8*128*11=11264 = 11KB of text.
+
 	tests := []struct {
 		expectedStatus probe.Result
 		expectError    bool
+		input          string
 		output         string
 		err            error
 	}{
 		// Ok
-		{probe.Success, false, "OK", nil},
+		{probe.Success, false, "OK", "OK", nil},
 		// Ok
-		{probe.Success, false, "OK", &fakeExitError{true, 0}},
+		{probe.Success, false, "OK", "OK", &fakeExitError{true, 0}},
+		// Ok - truncated output
+		{probe.Success, false, elevenKilobyte, tenKilobyte, nil},
 		// Run returns error
-		{probe.Unknown, true, "", fmt.Errorf("test error")},
+		{probe.Unknown, true, "", "", fmt.Errorf("test error")},
 		// Unhealthy
-		{probe.Failure, false, "Fail", &fakeExitError{true, 1}},
+		{probe.Failure, false, "Fail", "", &fakeExitError{true, 1}},
 	}
 	for i, test := range tests {
 		fake := FakeCmd{

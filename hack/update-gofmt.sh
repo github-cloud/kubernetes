@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,14 +20,10 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+source "${KUBE_ROOT}/hack/lib/init.sh"
 
-GO_VERSION=($(go version))
-
-if [[ -z $(echo "${GO_VERSION[2]}" | grep -E 'go1.4|go1.5') ]]; then
-  echo "Unsupported go version '${GO_VERSION}', skipping gofmt."
-  exit 0
-fi
+kube::golang::verify_go_version
 
 cd "${KUBE_ROOT}"
 
@@ -35,15 +31,16 @@ find_files() {
   find . -not \( \
       \( \
         -wholename './output' \
+        -o -wholename './.git' \
         -o -wholename './_output' \
         -o -wholename './_gopath' \
         -o -wholename './release' \
         -o -wholename './target' \
         -o -wholename '*/third_party/*' \
-        -o -wholename '*/Godeps/*' \
+        -o -wholename '*/vendor/*' \
+        -o -wholename './staging/src/k8s.io/client-go/*vendor/*' \
       \) -prune \
     \) -name '*.go'
 }
 
-GOFMT="gofmt -s -w"
-find_files | xargs $GOFMT
+find_files | xargs gofmt -s -w

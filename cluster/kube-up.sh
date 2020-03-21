@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,41 +24,52 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-EXIT_ON_WEAK_ERROR="${EXIT_ON_WEAK_ERROR:-true}"
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 
 if [ -f "${KUBE_ROOT}/cluster/env.sh" ]; then
     source "${KUBE_ROOT}/cluster/env.sh"
 fi
 
-source "${KUBE_ROOT}/cluster/kube-env.sh"
 source "${KUBE_ROOT}/cluster/kube-util.sh"
 
-echo "... Starting cluster using provider: $KUBERNETES_PROVIDER" >&2
+if [ -z "${ZONE-}" ]; then
+  echo "... Starting cluster using provider: ${KUBERNETES_PROVIDER}" >&2
+else
+  echo "... Starting cluster in ${ZONE} using provider ${KUBERNETES_PROVIDER}" >&2
+fi
 
 echo "... calling verify-prereqs" >&2
 verify-prereqs
-
-if [[ "${KUBE_STAGE_IMAGES:-}" == "true" ]]; then
-  echo "... staging images" >&2
-  stage-images
-fi
+echo "... calling verify-kube-binaries" >&2
+verify-kube-binaries
+echo "... calling verify-release-tars" >&2
+verify-release-tars
 
 echo "... calling kube-up" >&2
 kube-up
 
 echo "... calling validate-cluster" >&2
-if [[ "${EXIT_ON_WEAK_ERROR}" == "true" ]]; then
-	validate-cluster
-else
-	if ! validate-cluster; then
-		local validate_result="$?"
-		if [[ "${validate_result}" == "1" ]]; then
-			exit 1
-		elif [[ "${validate_result}" == "2" ]]; then
-			echo "...ignoring non-fatal errors in validate-cluster" >&2
-		fi
-	fi
+# Override errexit
+(validate-cluster) && validate_result="$?" || validate_result="$?"
+
+# We have two different failure modes from validate cluster:
+# - 1: fatal error - cluster won't be working correctly
+# - 2: weak error - something went wrong, but cluster probably will be working correctly
+# We just print an error message in case 2).
+if [[ "${validate_result}" == "1" ]]; then
+	exit 1
+elif [[ "${validate_result}" == "2" ]]; then
+	echo "...ignoring non-fatal errors in validate-cluster" >&2
+fi
+
+if [[ "${ENABLE_PROXY:-}" == "true" ]]; then
+  # shellcheck disable=SC1091
+  . /tmp/kube-proxy-env
+  echo ""
+  echo "*** Please run the following to add the kube-apiserver endpoint to your proxy white-list ***"
+  cat /tmp/kube-proxy-env
+  echo "***                                                                                      ***"
+  echo ""
 fi
 
 echo -e "Done, listing cluster services:\n" >&2

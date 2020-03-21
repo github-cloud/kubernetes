@@ -1,7 +1,7 @@
 // +build !linux
 
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,9 +18,21 @@ limitations under the License.
 
 package selinux
 
-type realChconRunner struct{}
+// SELinuxEnabled always returns false on non-linux platforms.
+func SELinuxEnabled() bool {
+	return false
+}
 
-func (_ *realChconRunner) SetContext(dir, context string) error {
-	// NOP
+// realSELinuxRunner is the NOP implementation of the SELinuxRunner interface.
+type realSELinuxRunner struct{}
+
+var _ SELinuxRunner = &realSELinuxRunner{}
+
+func (_ *realSELinuxRunner) Getfilecon(path string) (string, error) {
+	return "", nil
+}
+
+// FileLabel returns the SELinux label for this path or returns an error.
+func SetFileLabel(path string, label string) error {
 	return nil
 }

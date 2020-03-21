@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,18 +19,26 @@ package lifecycle
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/klog"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/intstr"
+	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	"k8s.io/kubernetes/pkg/security/apparmor"
+	utilio "k8s.io/utils/io"
+)
+
+const (
+	maxRespBodyLength = 10 * 1 << 10 // 10KB
 )
 
 type HandlerRunner struct {
-	httpGetter       kubetypes.HttpGetter
+	httpGetter       kubetypes.HTTPGetter
 	commandRunner    kubecontainer.ContainerCommandRunner
 	containerManager podStatusProvider
 }
@@ -39,7 +47,7 @@ type podStatusProvider interface {
 	GetPodStatus(uid types.UID, name, namespace string) (*kubecontainer.PodStatus, error)
 }
 
-func NewHandlerRunner(httpGetter kubetypes.HttpGetter, commandRunner kubecontainer.ContainerCommandRunner, containerManager podStatusProvider) kubecontainer.HandlerRunner {
+func NewHandlerRunner(httpGetter kubetypes.HTTPGetter, commandRunner kubecontainer.ContainerCommandRunner, containerManager podStatusProvider) kubecontainer.HandlerRunner {
 	return &HandlerRunner{
 		httpGetter:       httpGetter,
 		commandRunner:    commandRunner,
@@ -47,27 +55,39 @@ func NewHandlerRunner(httpGetter kubetypes.HttpGetter, commandRunner kubecontain
 	}
 }
 
-func (hr *HandlerRunner) Run(containerID kubecontainer.ContainerID, pod *api.Pod, container *api.Container, handler *api.Handler) error {
+func (hr *HandlerRunner) Run(containerID kubecontainer.ContainerID, pod *v1.Pod, container *v1.Container, handler *v1.Handler) (string, error) {
 	switch {
 	case handler.Exec != nil:
-		_, err := hr.commandRunner.RunInContainer(containerID, handler.Exec.Command)
-		return err
+		var msg string
+		// TODO(tallclair): Pass a proper timeout value.
+		output, err := hr.commandRunner.RunInContainer(containerID, handler.Exec.Command, 0)
+		if err != nil {
+			msg = fmt.Sprintf("Exec lifecycle hook (%v) for Container %q in Pod %q failed - error: %v, message: %q", handler.Exec.Command, container.Name, format.Pod(pod), err, string(output))
+			klog.V(1).Infof(msg)
+		}
+		return msg, err
 	case handler.HTTPGet != nil:
-		return hr.runHTTPHandler(pod, container, handler)
+		msg, err := hr.runHTTPHandler(pod, container, handler)
+		if err != nil {
+			msg = fmt.Sprintf("Http lifecycle hook (%s) for Container %q in Pod %q failed - error: %v, message: %q", handler.HTTPGet.Path, container.Name, format.Pod(pod), err, msg)
+			klog.V(1).Infof(msg)
+		}
+		return msg, err
 	default:
-		err := fmt.Errorf("Invalid handler: %v", handler)
-		glog.Errorf("Cannot run handler: %v", err)
-		return err
+		err := fmt.Errorf("invalid handler: %v", handler)
+		msg := fmt.Sprintf("Cannot run handler: %v", err)
+		klog.Errorf(msg)
+		return msg, err
 	}
 }
 
-// resolvePort attempts to turn a IntOrString port reference into a concrete port number.
+// resolvePort attempts to turn an IntOrString port reference into a concrete port number.
 // If portReference has an int value, it is treated as a literal, and simply returns that value.
 // If portReference is a string, an attempt is first made to parse it as an integer.  If that fails,
 // an attempt is made to find a port with the same name in the container spec.
 // If a port with the same name is found, it's ContainerPort value is returned.  If no matching
 // port is found, an error is returned.
-func resolvePort(portReference intstr.IntOrString, container *api.Container) (int, error) {
+func resolvePort(portReference intstr.IntOrString, container *v1.Container) (int, error) {
 	if portReference.Type == intstr.Int {
 		return portReference.IntValue(), nil
 	}
@@ -78,24 +98,24 @@ func resolvePort(portReference intstr.IntOrString, container *api.Container) (in
 	}
 	for _, portSpec := range container.Ports {
 		if portSpec.Name == portName {
-			return portSpec.ContainerPort, nil
+			return int(portSpec.ContainerPort), nil
 		}
 	}
 	return -1, fmt.Errorf("couldn't find port: %v in %v", portReference, container)
 }
 
-func (hr *HandlerRunner) runHTTPHandler(pod *api.Pod, container *api.Container, handler *api.Handler) error {
+func (hr *HandlerRunner) runHTTPHandler(pod *v1.Pod, container *v1.Container, handler *v1.Handler) (string, error) {
 	host := handler.HTTPGet.Host
 	if len(host) == 0 {
 		status, err := hr.containerManager.GetPodStatus(pod.UID, pod.Name, pod.Namespace)
 		if err != nil {
-			glog.Errorf("Unable to get pod info, event handlers may be invalid.")
-			return err
+			klog.Errorf("Unable to get pod info, event handlers may be invalid.")
+			return "", err
 		}
-		if status.IP == "" {
-			return fmt.Errorf("failed to find networking container: %v", status)
+		if len(status.IPs) == 0 {
+			return "", fmt.Errorf("failed to find networking container: %v", status)
 		}
-		host = status.IP
+		host = status.IPs[0]
 	}
 	var port int
 	if handler.HTTPGet.Port.Type == intstr.String && len(handler.HTTPGet.Port.StrVal) == 0 {
@@ -104,10 +124,184 @@ func (hr *HandlerRunner) runHTTPHandler(pod *api.Pod, container *api.Container, 
 		var err error
 		port, err = resolvePort(handler.HTTPGet.Port, container)
 		if err != nil {
-			return err
+			return "", err
 		}
 	}
 	url := fmt.Sprintf("http://%s/%s", net.JoinHostPort(host, strconv.Itoa(port)), handler.HTTPGet.Path)
-	_, err := hr.httpGetter.Get(url)
-	return err
+	resp, err := hr.httpGetter.Get(url)
+	return getHttpRespBody(resp), err
+}
+
+func getHttpRespBody(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	bytes, err := utilio.ReadAtMost(resp.Body, maxRespBodyLength)
+	if err == nil || err == utilio.ErrLimitReached {
+		return string(bytes)
+	}
+	return ""
+}
+
+func NewAppArmorAdmitHandler(validator apparmor.Validator) PodAdmitHandler {
+	return &appArmorAdmitHandler{
+		Validator: validator,
+	}
+}
+
+type appArmorAdmitHandler struct {
+	apparmor.Validator
+}
+
+func (a *appArmorAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult {
+	// If the pod is already running or terminated, no need to recheck AppArmor.
+	if attrs.Pod.Status.Phase != v1.PodPending {
+		return PodAdmitResult{Admit: true}
+	}
+
+	err := a.Validate(attrs.Pod)
+	if err == nil {
+		return PodAdmitResult{Admit: true}
+	}
+	return PodAdmitResult{
+		Admit:   false,
+		Reason:  "AppArmor",
+		Message: fmt.Sprintf("Cannot enforce AppArmor: %v", err),
+	}
+}
+
+func NewNoNewPrivsAdmitHandler(runtime kubecontainer.Runtime) PodAdmitHandler {
+	return &noNewPrivsAdmitHandler{
+		Runtime: runtime,
+	}
+}
+
+type noNewPrivsAdmitHandler struct {
+	kubecontainer.Runtime
+}
+
+func (a *noNewPrivsAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult {
+	// If the pod is already running or terminated, no need to recheck NoNewPrivs.
+	if attrs.Pod.Status.Phase != v1.PodPending {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// If the containers in a pod do not require no-new-privs, admit it.
+	if !noNewPrivsRequired(attrs.Pod) {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// Always admit runtimes except docker.
+	if a.Runtime.Type() != kubetypes.DockerContainerRuntime {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// Make sure docker api version is valid.
+	rversion, err := a.Runtime.APIVersion()
+	if err != nil {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "NoNewPrivs",
+			Message: fmt.Sprintf("Cannot enforce NoNewPrivs: %v", err),
+		}
+	}
+	v, err := rversion.Compare("1.23.0")
+	if err != nil {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "NoNewPrivs",
+			Message: fmt.Sprintf("Cannot enforce NoNewPrivs: %v", err),
+		}
+	}
+	// If the version is less than 1.23 it will return -1 above.
+	if v == -1 {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "NoNewPrivs",
+			Message: fmt.Sprintf("Cannot enforce NoNewPrivs: docker runtime API version %q must be greater than or equal to 1.23", rversion.String()),
+		}
+	}
+
+	return PodAdmitResult{Admit: true}
+}
+
+func noNewPrivsRequired(pod *v1.Pod) bool {
+	// Iterate over pod containers and check if we added no-new-privs.
+	for _, c := range pod.Spec.Containers {
+		if c.SecurityContext != nil && c.SecurityContext.AllowPrivilegeEscalation != nil && !*c.SecurityContext.AllowPrivilegeEscalation {
+			return true
+		}
+	}
+	return false
+}
+
+func NewProcMountAdmitHandler(runtime kubecontainer.Runtime) PodAdmitHandler {
+	return &procMountAdmitHandler{
+		Runtime: runtime,
+	}
+}
+
+type procMountAdmitHandler struct {
+	kubecontainer.Runtime
+}
+
+func (a *procMountAdmitHandler) Admit(attrs *PodAdmitAttributes) PodAdmitResult {
+	// If the pod is already running or terminated, no need to recheck NoNewPrivs.
+	if attrs.Pod.Status.Phase != v1.PodPending {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// If the containers in a pod only need the default ProcMountType, admit it.
+	if procMountIsDefault(attrs.Pod) {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// Always admit runtimes except docker.
+	if a.Runtime.Type() != kubetypes.DockerContainerRuntime {
+		return PodAdmitResult{Admit: true}
+	}
+
+	// Make sure docker api version is valid.
+	// Merged in https://github.com/moby/moby/pull/36644
+	rversion, err := a.Runtime.APIVersion()
+	if err != nil {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "ProcMount",
+			Message: fmt.Sprintf("Cannot enforce ProcMount: %v", err),
+		}
+	}
+	v, err := rversion.Compare("1.38.0")
+	if err != nil {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "ProcMount",
+			Message: fmt.Sprintf("Cannot enforce ProcMount: %v", err),
+		}
+	}
+	// If the version is less than 1.38 it will return -1 above.
+	if v == -1 {
+		return PodAdmitResult{
+			Admit:   false,
+			Reason:  "ProcMount",
+			Message: fmt.Sprintf("Cannot enforce ProcMount: docker runtime API version %q must be greater than or equal to 1.38", rversion.String()),
+		}
+	}
+
+	return PodAdmitResult{Admit: true}
+}
+
+func procMountIsDefault(pod *v1.Pod) bool {
+	// Iterate over pod containers and check if we are using the DefaultProcMountType
+	// for all containers.
+	for _, c := range pod.Spec.Containers {
+		if c.SecurityContext != nil {
+			if c.SecurityContext.ProcMount != nil && *c.SecurityContext.ProcMount != v1.DefaultProcMount {
+				return false
+			}
+		}
+	}
+
+	return true
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,14 +21,15 @@ import (
 	"fmt"
 	"net"
 	"reflect"
-	"strconv"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/proxy"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/kubernetes/pkg/proxy/util"
 	"k8s.io/kubernetes/pkg/util/slice"
 )
 
@@ -46,9 +47,9 @@ type affinityState struct {
 }
 
 type affinityPolicy struct {
-	affinityType api.ServiceAffinity
+	affinityType v1.ServiceAffinity
 	affinityMap  map[string]*affinityState // map client IP -> affinity info
-	ttlMinutes   int
+	ttlSeconds   int
 }
 
 // LoadBalancerRR is a round-robin load balancer.
@@ -66,11 +67,11 @@ type balancerState struct {
 	affinity  affinityPolicy
 }
 
-func newAffinityPolicy(affinityType api.ServiceAffinity, ttlMinutes int) *affinityPolicy {
+func newAffinityPolicy(affinityType v1.ServiceAffinity, ttlSeconds int) *affinityPolicy {
 	return &affinityPolicy{
 		affinityType: affinityType,
 		affinityMap:  make(map[string]*affinityState),
-		ttlMinutes:   ttlMinutes,
+		ttlSeconds:   ttlSeconds,
 	}
 }
 
@@ -81,40 +82,58 @@ func NewLoadBalancerRR() *LoadBalancerRR {
 	}
 }
 
-func (lb *LoadBalancerRR) NewService(svcPort proxy.ServicePortName, affinityType api.ServiceAffinity, ttlMinutes int) error {
+func (lb *LoadBalancerRR) NewService(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) error {
+	klog.V(4).Infof("LoadBalancerRR NewService %q", svcPort)
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-	lb.newServiceInternal(svcPort, affinityType, ttlMinutes)
+	lb.newServiceInternal(svcPort, affinityType, ttlSeconds)
 	return nil
 }
 
 // This assumes that lb.lock is already held.
-func (lb *LoadBalancerRR) newServiceInternal(svcPort proxy.ServicePortName, affinityType api.ServiceAffinity, ttlMinutes int) *balancerState {
-	if ttlMinutes == 0 {
-		ttlMinutes = 180 //default to 3 hours if not specified.  Should 0 be unlimited instead????
+func (lb *LoadBalancerRR) newServiceInternal(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) *balancerState {
+	if ttlSeconds == 0 {
+		ttlSeconds = int(v1.DefaultClientIPServiceAffinitySeconds) //default to 3 hours if not specified.  Should 0 be unlimited instead????
 	}
 
 	if _, exists := lb.services[svcPort]; !exists {
-		lb.services[svcPort] = &balancerState{affinity: *newAffinityPolicy(affinityType, ttlMinutes)}
-		glog.V(4).Infof("LoadBalancerRR service %q did not exist, created", svcPort)
+		lb.services[svcPort] = &balancerState{affinity: *newAffinityPolicy(affinityType, ttlSeconds)}
+		klog.V(4).Infof("LoadBalancerRR service %q did not exist, created", svcPort)
 	} else if affinityType != "" {
 		lb.services[svcPort].affinity.affinityType = affinityType
 	}
 	return lb.services[svcPort]
 }
 
+func (lb *LoadBalancerRR) DeleteService(svcPort proxy.ServicePortName) {
+	klog.V(4).Infof("LoadBalancerRR DeleteService %q", svcPort)
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+	delete(lb.services, svcPort)
+}
+
 // return true if this service is using some form of session affinity.
 func isSessionAffinity(affinity *affinityPolicy) bool {
 	// Should never be empty string, but checking for it to be safe.
-	if affinity.affinityType == "" || affinity.affinityType == api.ServiceAffinityNone {
+	if affinity.affinityType == "" || affinity.affinityType == v1.ServiceAffinityNone {
 		return false
 	}
 	return true
 }
 
+// ServiceHasEndpoints checks whether a service entry has endpoints.
+func (lb *LoadBalancerRR) ServiceHasEndpoints(svcPort proxy.ServicePortName) bool {
+	lb.lock.RLock()
+	defer lb.lock.RUnlock()
+	state, exists := lb.services[svcPort]
+	// TODO: while nothing ever assigns nil to the map, *some* of the code using the map
+	// checks for it.  The code should all follow the same convention.
+	return exists && state != nil && len(state.endpoints) > 0
+}
+
 // NextEndpoint returns a service endpoint.
 // The service endpoint is chosen using the round-robin algorithm.
-func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr net.Addr) (string, error) {
+func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr net.Addr, sessionAffinityReset bool) (string, error) {
 	// Coarse locking is simple.  We can get more fine-grained if/when we
 	// can prove it matters.
 	lb.lock.Lock()
@@ -127,7 +146,7 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 	if len(state.endpoints) == 0 {
 		return "", ErrMissingEndpoints
 	}
-	glog.V(4).Infof("NextEndpoint for service %q, srcAddr=%v: endpoints: %+v", svcPort, srcAddr, state.endpoints)
+	klog.V(4).Infof("NextEndpoint for service %q, srcAddr=%v: endpoints: %+v", svcPort, srcAddr, state.endpoints)
 
 	sessionAffinityEnabled := isSessionAffinity(&state.affinity)
 
@@ -139,13 +158,15 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 		if err != nil {
 			return "", fmt.Errorf("malformed source address %q: %v", srcAddr.String(), err)
 		}
-		sessionAffinity, exists := state.affinity.affinityMap[ipaddr]
-		if exists && int(time.Now().Sub(sessionAffinity.lastUsed).Minutes()) < state.affinity.ttlMinutes {
-			// Affinity wins.
-			endpoint := sessionAffinity.endpoint
-			sessionAffinity.lastUsed = time.Now()
-			glog.V(4).Infof("NextEndpoint for service %q from IP %s with sessionAffinity %+v: %s", svcPort, ipaddr, sessionAffinity, endpoint)
-			return endpoint, nil
+		if !sessionAffinityReset {
+			sessionAffinity, exists := state.affinity.affinityMap[ipaddr]
+			if exists && int(time.Since(sessionAffinity.lastUsed).Seconds()) < state.affinity.ttlSeconds {
+				// Affinity wins.
+				endpoint := sessionAffinity.endpoint
+				sessionAffinity.lastUsed = time.Now()
+				klog.V(4).Infof("NextEndpoint for service %q from IP %s with sessionAffinity %#v: %s", svcPort, ipaddr, sessionAffinity, endpoint)
+				return endpoint, nil
+			}
 		}
 	}
 	// Take the next endpoint.
@@ -162,39 +183,17 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 		affinity.lastUsed = time.Now()
 		affinity.endpoint = endpoint
 		affinity.clientIP = ipaddr
-		glog.V(4).Infof("Updated affinity key %s: %+v", ipaddr, state.affinity.affinityMap[ipaddr])
+		klog.V(4).Infof("Updated affinity key %s: %#v", ipaddr, state.affinity.affinityMap[ipaddr])
 	}
 
 	return endpoint, nil
-}
-
-type hostPortPair struct {
-	host string
-	port int
-}
-
-func isValidEndpoint(hpp *hostPortPair) bool {
-	return hpp.host != "" && hpp.port > 0
-}
-
-func flattenValidEndpoints(endpoints []hostPortPair) []string {
-	// Convert Endpoint objects into strings for easier use later.  Ignore
-	// the protocol field - we'll get that from the Service objects.
-	var result []string
-	for i := range endpoints {
-		hpp := &endpoints[i]
-		if isValidEndpoint(hpp) {
-			result = append(result, net.JoinHostPort(hpp.host, strconv.Itoa(hpp.port)))
-		}
-	}
-	return result
 }
 
 // Remove any session affinity records associated to a particular endpoint (for example when a pod goes down).
 func removeSessionAffinityByEndpoint(state *balancerState, svcPort proxy.ServicePortName, endpoint string) {
 	for _, affinity := range state.affinity.affinityMap {
 		if affinity.endpoint == endpoint {
-			glog.V(4).Infof("Removing client: %s from affinityMap for service %q", affinity.endpoint, svcPort)
+			klog.V(4).Infof("Removing client: %s from affinityMap for service %q", affinity.endpoint, svcPort)
 			delete(state.affinity.affinityMap, affinity.clientIP)
 		}
 	}
@@ -203,85 +202,117 @@ func removeSessionAffinityByEndpoint(state *balancerState, svcPort proxy.Service
 // Loop through the valid endpoints and then the endpoints associated with the Load Balancer.
 // Then remove any session affinity records that are not in both lists.
 // This assumes the lb.lock is held.
-func (lb *LoadBalancerRR) updateAffinityMap(svcPort proxy.ServicePortName, newEndpoints []string) {
-	allEndpoints := map[string]int{}
+func (lb *LoadBalancerRR) removeStaleAffinity(svcPort proxy.ServicePortName, newEndpoints []string) {
+	newEndpointsSet := sets.NewString()
 	for _, newEndpoint := range newEndpoints {
-		allEndpoints[newEndpoint] = 1
+		newEndpointsSet.Insert(newEndpoint)
 	}
+
 	state, exists := lb.services[svcPort]
 	if !exists {
 		return
 	}
 	for _, existingEndpoint := range state.endpoints {
-		allEndpoints[existingEndpoint] = allEndpoints[existingEndpoint] + 1
-	}
-	for mKey, mVal := range allEndpoints {
-		if mVal == 1 {
-			glog.V(2).Infof("Delete endpoint %s for service %q", mKey, svcPort)
-			removeSessionAffinityByEndpoint(state, svcPort, mKey)
+		if !newEndpointsSet.Has(existingEndpoint) {
+			klog.V(2).Infof("Delete endpoint %s for service %q", existingEndpoint, svcPort)
+			removeSessionAffinityByEndpoint(state, svcPort, existingEndpoint)
 		}
 	}
 }
 
-// OnEndpointsUpdate manages the registered service endpoints.
-// Registered endpoints are updated if found in the update set or
-// unregistered if missing from the update set.
-func (lb *LoadBalancerRR) OnEndpointsUpdate(allEndpoints []api.Endpoints) {
-	registeredEndpoints := make(map[proxy.ServicePortName]bool)
+func (lb *LoadBalancerRR) OnEndpointsAdd(endpoints *v1.Endpoints) {
+	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
+
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 
-	// Update endpoints for services.
-	for i := range allEndpoints {
-		svcEndpoints := &allEndpoints[i]
+	for portname := range portsToEndpoints {
+		svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}, Port: portname}
+		newEndpoints := portsToEndpoints[portname]
+		state, exists := lb.services[svcPort]
 
-		// We need to build a map of portname -> all ip:ports for that
-		// portname.  Explode Endpoints.Subsets[*] into this structure.
-		portsToEndpoints := map[string][]hostPortPair{}
-		for i := range svcEndpoints.Subsets {
-			ss := &svcEndpoints.Subsets[i]
-			for i := range ss.Ports {
-				port := &ss.Ports[i]
-				for i := range ss.Addresses {
-					addr := &ss.Addresses[i]
-					portsToEndpoints[port.Name] = append(portsToEndpoints[port.Name], hostPortPair{addr.IP, port.Port})
-					// Ignore the protocol field - we'll get that from the Service objects.
-				}
-			}
-		}
+		if !exists || state == nil || len(newEndpoints) > 0 {
+			klog.V(1).Infof("LoadBalancerRR: Setting endpoints for %s to %+v", svcPort, newEndpoints)
+			// OnEndpointsAdd can be called without NewService being called externally.
+			// To be safe we will call it here.  A new service will only be created
+			// if one does not already exist.
+			state = lb.newServiceInternal(svcPort, v1.ServiceAffinity(""), 0)
+			state.endpoints = util.ShuffleStrings(newEndpoints)
 
-		for portname := range portsToEndpoints {
-			svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: svcEndpoints.Namespace, Name: svcEndpoints.Name}, Port: portname}
-			state, exists := lb.services[svcPort]
-			curEndpoints := []string{}
-			if state != nil {
-				curEndpoints = state.endpoints
-			}
-			newEndpoints := flattenValidEndpoints(portsToEndpoints[portname])
-
-			if !exists || state == nil || len(curEndpoints) != len(newEndpoints) || !slicesEquiv(slice.CopyStrings(curEndpoints), newEndpoints) {
-				glog.V(1).Infof("LoadBalancerRR: Setting endpoints for %s to %+v", svcPort, newEndpoints)
-				lb.updateAffinityMap(svcPort, newEndpoints)
-				// OnEndpointsUpdate can be called without NewService being called externally.
-				// To be safe we will call it here.  A new service will only be created
-				// if one does not already exist.  The affinity will be updated
-				// later, once NewService is called.
-				state = lb.newServiceInternal(svcPort, api.ServiceAffinity(""), 0)
-				state.endpoints = slice.ShuffleStrings(newEndpoints)
-
-				// Reset the round-robin index.
-				state.index = 0
-			}
-			registeredEndpoints[svcPort] = true
+			// Reset the round-robin index.
+			state.index = 0
 		}
 	}
-	// Remove endpoints missing from the update.
-	for k := range lb.services {
-		if _, exists := registeredEndpoints[k]; !exists {
-			glog.V(2).Infof("LoadBalancerRR: Removing endpoints for %s", k)
-			delete(lb.services, k)
+}
+
+func (lb *LoadBalancerRR) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {
+	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
+	oldPortsToEndpoints := util.BuildPortsToEndpointsMap(oldEndpoints)
+	registeredEndpoints := make(map[proxy.ServicePortName]bool)
+
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	for portname := range portsToEndpoints {
+		svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}, Port: portname}
+		newEndpoints := portsToEndpoints[portname]
+		state, exists := lb.services[svcPort]
+
+		curEndpoints := []string{}
+		if state != nil {
+			curEndpoints = state.endpoints
+		}
+
+		if !exists || state == nil || len(curEndpoints) != len(newEndpoints) || !slicesEquiv(slice.CopyStrings(curEndpoints), newEndpoints) {
+			klog.V(1).Infof("LoadBalancerRR: Setting endpoints for %s to %+v", svcPort, newEndpoints)
+			lb.removeStaleAffinity(svcPort, newEndpoints)
+			// OnEndpointsUpdate can be called without NewService being called externally.
+			// To be safe we will call it here.  A new service will only be created
+			// if one does not already exist.  The affinity will be updated
+			// later, once NewService is called.
+			state = lb.newServiceInternal(svcPort, v1.ServiceAffinity(""), 0)
+			state.endpoints = util.ShuffleStrings(newEndpoints)
+
+			// Reset the round-robin index.
+			state.index = 0
+		}
+		registeredEndpoints[svcPort] = true
+	}
+
+	// Now remove all endpoints missing from the update.
+	for portname := range oldPortsToEndpoints {
+		svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: oldEndpoints.Namespace, Name: oldEndpoints.Name}, Port: portname}
+		if _, exists := registeredEndpoints[svcPort]; !exists {
+			lb.resetService(svcPort)
 		}
 	}
+}
+
+func (lb *LoadBalancerRR) resetService(svcPort proxy.ServicePortName) {
+	// If the service is still around, reset but don't delete.
+	if state, ok := lb.services[svcPort]; ok {
+		if len(state.endpoints) > 0 {
+			klog.V(2).Infof("LoadBalancerRR: Removing endpoints for %s", svcPort)
+			state.endpoints = []string{}
+		}
+		state.index = 0
+		state.affinity.affinityMap = map[string]*affinityState{}
+	}
+}
+
+func (lb *LoadBalancerRR) OnEndpointsDelete(endpoints *v1.Endpoints) {
+	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
+
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	for portname := range portsToEndpoints {
+		svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}, Port: portname}
+		lb.resetService(svcPort)
+	}
+}
+
+func (lb *LoadBalancerRR) OnEndpointsSynced() {
 }
 
 // Tests whether two slices are equivalent.  This sorts both slices in-place.
@@ -304,8 +335,8 @@ func (lb *LoadBalancerRR) CleanupStaleStickySessions(svcPort proxy.ServicePortNa
 		return
 	}
 	for ip, affinity := range state.affinity.affinityMap {
-		if int(time.Now().Sub(affinity.lastUsed).Minutes()) >= state.affinity.ttlMinutes {
-			glog.V(4).Infof("Removing client %s from affinityMap for service %q", affinity.clientIP, svcPort)
+		if int(time.Since(affinity.lastUsed).Seconds()) >= state.affinity.ttlSeconds {
+			klog.V(4).Infof("Removing client %s from affinityMap for service %q", affinity.clientIP, svcPort)
 			delete(state.affinity.affinityMap, ip)
 		}
 	}

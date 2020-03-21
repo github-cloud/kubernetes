@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,21 +17,30 @@ limitations under the License.
 package alwayspullimages
 
 import (
+	"context"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/runtime"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/admission"
+	admissiontesting "k8s.io/apiserver/pkg/admission/testing"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 // TestAdmission verifies all create requests for pods result in every container's image pull policy
 // set to Always
 func TestAdmission(t *testing.T) {
 	namespace := "test"
-	handler := &alwaysPullImages{}
+	handler := admissiontesting.WithReinvocationTesting(t, &AlwaysPullImages{})
 	pod := api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: "123", Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: namespace},
 		Spec: api.PodSpec{
+			InitContainers: []api.Container{
+				{Name: "init1", Image: "image"},
+				{Name: "init2", Image: "image", ImagePullPolicy: api.PullNever},
+				{Name: "init3", Image: "image", ImagePullPolicy: api.PullIfNotPresent},
+				{Name: "init4", Image: "image", ImagePullPolicy: api.PullAlways},
+			},
 			Containers: []api.Container{
 				{Name: "ctr1", Image: "image"},
 				{Name: "ctr2", Image: "image", ImagePullPolicy: api.PullNever},
@@ -40,14 +49,55 @@ func TestAdmission(t *testing.T) {
 			},
 		},
 	}
-	err := handler.Admit(admission.NewAttributesRecord(&pod, api.Kind("Pod"), pod.Namespace, pod.Name, api.Resource("pods"), "", admission.Create, nil))
+	err := handler.Admit(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 	if err != nil {
 		t.Errorf("Unexpected error returned from admission handler")
 	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.ImagePullPolicy != api.PullAlways {
+			t.Errorf("Container %v: expected pull always, got %v", c, c.ImagePullPolicy)
+		}
+	}
 	for _, c := range pod.Spec.Containers {
 		if c.ImagePullPolicy != api.PullAlways {
-			t.Errorf("Container %s: expected pull always, got %v", c.ImagePullPolicy)
+			t.Errorf("Container %v: expected pull always, got %v", c, c.ImagePullPolicy)
 		}
+	}
+}
+
+func TestValidate(t *testing.T) {
+	namespace := "test"
+	handler := &AlwaysPullImages{}
+	pod := api.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: namespace},
+		Spec: api.PodSpec{
+			InitContainers: []api.Container{
+				{Name: "init1", Image: "image"},
+				{Name: "init2", Image: "image", ImagePullPolicy: api.PullNever},
+				{Name: "init3", Image: "image", ImagePullPolicy: api.PullIfNotPresent},
+				{Name: "init4", Image: "image", ImagePullPolicy: api.PullAlways},
+			},
+			Containers: []api.Container{
+				{Name: "ctr1", Image: "image"},
+				{Name: "ctr2", Image: "image", ImagePullPolicy: api.PullNever},
+				{Name: "ctr3", Image: "image", ImagePullPolicy: api.PullIfNotPresent},
+				{Name: "ctr4", Image: "image", ImagePullPolicy: api.PullAlways},
+			},
+		},
+	}
+	expectedError := `[` +
+		`pods "123" is forbidden: spec.initContainers[0].imagePullPolicy: Unsupported value: "": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.initContainers[1].imagePullPolicy: Unsupported value: "Never": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.initContainers[2].imagePullPolicy: Unsupported value: "IfNotPresent": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.containers[0].imagePullPolicy: Unsupported value: "": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.containers[1].imagePullPolicy: Unsupported value: "Never": supported values: "Always", ` +
+		`pods "123" is forbidden: spec.containers[2].imagePullPolicy: Unsupported value: "IfNotPresent": supported values: "Always"]`
+	err := handler.Validate(context.TODO(), admission.NewAttributesRecord(&pod, nil, api.Kind("Pod").WithVersion("version"), pod.Namespace, pod.Name, api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
+	if err == nil {
+		t.Fatal("missing expected error")
+	}
+	if err.Error() != expectedError {
+		t.Fatal(err)
 	}
 }
 
@@ -57,7 +107,7 @@ func TestOtherResources(t *testing.T) {
 	namespace := "testnamespace"
 	name := "testname"
 	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: api.PodSpec{
 			Containers: []api.Container{
 				{Name: "ctr2", Image: "image", ImagePullPolicy: api.PullNever},
@@ -95,9 +145,9 @@ func TestOtherResources(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		handler := &alwaysPullImages{}
+		handler := admissiontesting.WithReinvocationTesting(t, &AlwaysPullImages{})
 
-		err := handler.Admit(admission.NewAttributesRecord(tc.object, api.Kind(tc.kind), namespace, name, api.Resource(tc.resource), tc.subresource, admission.Create, nil))
+		err := handler.Admit(context.TODO(), admission.NewAttributesRecord(tc.object, nil, api.Kind(tc.kind).WithVersion("version"), namespace, name, api.Resource(tc.resource).WithVersion("version"), tc.subresource, admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 
 		if tc.expectError {
 			if err == nil {

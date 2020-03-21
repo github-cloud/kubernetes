@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,94 +17,14 @@ limitations under the License.
 package kubelet
 
 import (
-	"fmt"
-
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/capabilities"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/securitycontext"
+	"os"
 )
 
-// Check whether we have the capabilities to run the specified pod.
-func canRunPod(pod *api.Pod) error {
-	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.HostNetwork {
-		allowed, err := allowHostNetwork(pod)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return fmt.Errorf("pod with UID %q specified host networking, but is disallowed", pod.UID)
-		}
-	}
-
-	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.HostPID {
-		allowed, err := allowHostPID(pod)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return fmt.Errorf("pod with UID %q specified host PID, but is disallowed", pod.UID)
-		}
-	}
-
-	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.HostIPC {
-		allowed, err := allowHostIPC(pod)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return fmt.Errorf("pod with UID %q specified host ipc, but is disallowed", pod.UID)
-		}
-	}
-
-	if !capabilities.Get().AllowPrivileged {
-		for _, container := range pod.Spec.Containers {
-			if securitycontext.HasPrivilegedRequest(&container) {
-				return fmt.Errorf("pod with UID %q specified privileged container, but is disallowed", pod.UID)
-			}
-		}
-	}
-	return nil
-}
-
-// Determined whether the specified pod is allowed to use host networking
-func allowHostNetwork(pod *api.Pod) (bool, error) {
-	podSource, err := kubetypes.GetPodSource(pod)
+// dirExists returns true if the path exists and represents a directory.
+func dirExists(path string) bool {
+	s, err := os.Stat(path)
 	if err != nil {
-		return false, err
+		return false
 	}
-	for _, source := range capabilities.Get().PrivilegedSources.HostNetworkSources {
-		if source == podSource {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// Determined whether the specified pod is allowed to use host networking
-func allowHostPID(pod *api.Pod) (bool, error) {
-	podSource, err := kubetypes.GetPodSource(pod)
-	if err != nil {
-		return false, err
-	}
-	for _, source := range capabilities.Get().PrivilegedSources.HostPIDSources {
-		if source == podSource {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// Determined whether the specified pod is allowed to use host ipc
-func allowHostIPC(pod *api.Pod) (bool, error) {
-	podSource, err := kubetypes.GetPodSource(pod)
-	if err != nil {
-		return false, err
-	}
-	for _, source := range capabilities.Get().PrivilegedSources.HostIPCSources {
-		if source == podSource {
-			return true, nil
-		}
-	}
-	return false, nil
+	return s.IsDir()
 }

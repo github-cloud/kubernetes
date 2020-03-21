@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,30 @@ limitations under the License.
 package deny
 
 import (
+	"context"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/admission"
-	"k8s.io/kubernetes/pkg/api"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/admission"
+	admissiontesting "k8s.io/apiserver/pkg/admission/testing"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 func TestAdmission(t *testing.T) {
-	handler := NewAlwaysDeny()
-	err := handler.Admit(admission.NewAttributesRecord(nil, api.Kind("kind"), "namespace", "name", api.Resource("resource"), "subresource", admission.Create, nil))
+	handler := admissiontesting.WithReinvocationTesting(t, NewAlwaysDeny().(*alwaysDeny))
+	err := handler.Admit(context.TODO(), admission.NewAttributesRecord(nil, nil, api.Kind("kind").WithVersion("version"), "namespace", "name", api.Resource("resource").WithVersion("version"), "subresource", admission.Create, &metav1.CreateOptions{}, false, nil), nil)
 	if err == nil {
-		t.Errorf("Expected error returned from admission handler")
+		t.Error("Expected error returned from admission handler")
+	}
+}
+
+func TestHandles(t *testing.T) {
+	handler := NewAlwaysDeny()
+	tests := []admission.Operation{admission.Create, admission.Connect, admission.Update, admission.Delete}
+
+	for _, test := range tests {
+		if !handler.Handles(test) {
+			t.Errorf("Expected handling all operations, including: %v", test)
+		}
 	}
 }

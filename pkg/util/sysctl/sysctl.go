@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,21 +24,65 @@ import (
 )
 
 const (
-	sysctlBase         = "/proc/sys"
-	VmOvercommitMemory = "vm/overcommit_memory"
-	VmPanicOnOOM       = "vm/panic_on_oom"
-	KernelPanic        = "kernel/panic"
-	KernelPanicOnOops  = "kernel/panic_on_oops"
+	sysctlBase = "/proc/sys"
+	// VMOvercommitMemory refers to the sysctl variable responsible for defining
+	// the memory over-commit policy used by kernel.
+	VMOvercommitMemory = "vm/overcommit_memory"
+	// VMPanicOnOOM refers to the sysctl variable responsible for defining
+	// the OOM behavior used by kernel.
+	VMPanicOnOOM = "vm/panic_on_oom"
+	// KernelPanic refers to the sysctl variable responsible for defining
+	// the timeout after a panic for the kernel to reboot.
+	KernelPanic = "kernel/panic"
+	// KernelPanicOnOops refers to the sysctl variable responsible for defining
+	// the kernel behavior when an oops or BUG is encountered.
+	KernelPanicOnOops = "kernel/panic_on_oops"
+	// RootMaxKeys refers to the sysctl variable responsible for defining
+	// the maximum number of keys that the root user (UID 0 in the root user namespace) may own.
+	RootMaxKeys = "kernel/keys/root_maxkeys"
+	// RootMaxBytes refers to the sysctl variable responsible for defining
+	// the maximum number of bytes of data that the root user (UID 0 in the root user namespace)
+	// can hold in the payloads of the keys owned by root.
+	RootMaxBytes = "kernel/keys/root_maxbytes"
 
-	VmOvercommitMemoryAlways    = 1 // kernel performs no memory over-commit handling
-	VmPanicOnOOMInvokeOOMKiller = 0 // kernel calls the oom_killer function when OOM occurs
+	// VMOvercommitMemoryAlways represents that kernel performs no memory over-commit handling.
+	VMOvercommitMemoryAlways = 1
+	// VMPanicOnOOMInvokeOOMKiller represents that kernel calls the oom_killer function when OOM occurs.
+	VMPanicOnOOMInvokeOOMKiller = 0
 
-	KernelPanicOnOopsAlways  = 1  // kernel panics on kernel oops
-	KernelPanicRebootTimeout = 10 // seconds after a panic for the kernel to reboot
+	// KernelPanicOnOopsAlways represents that kernel panics on kernel oops.
+	KernelPanicOnOopsAlways = 1
+	// KernelPanicRebootTimeout is the timeout seconds after a panic for the kernel to reboot.
+	KernelPanicRebootTimeout = 10
+
+	// RootMaxKeysSetting is the maximum number of keys that the root user (UID 0 in the root user namespace) may own.
+	// Needed since docker creates a new key per container.
+	RootMaxKeysSetting = 1000000
+	// RootMaxBytesSetting is the maximum number of bytes of data that the root user (UID 0 in the root user namespace)
+	// can hold in the payloads of the keys owned by root.
+	// Allocate 25 bytes per key * number of MaxKeys.
+	RootMaxBytesSetting = RootMaxKeysSetting * 25
 )
 
+// Interface is an injectable interface for running sysctl commands.
+type Interface interface {
+	// GetSysctl returns the value for the specified sysctl setting
+	GetSysctl(sysctl string) (int, error)
+	// SetSysctl modifies the specified sysctl flag to the new value
+	SetSysctl(sysctl string, newVal int) error
+}
+
+// New returns a new Interface for accessing sysctl
+func New() Interface {
+	return &procSysctl{}
+}
+
+// procSysctl implements Interface by reading and writing files under /proc/sys
+type procSysctl struct {
+}
+
 // GetSysctl returns the value for the specified sysctl setting
-func GetSysctl(sysctl string) (int, error) {
+func (*procSysctl) GetSysctl(sysctl string) (int, error) {
 	data, err := ioutil.ReadFile(path.Join(sysctlBase, sysctl))
 	if err != nil {
 		return -1, err
@@ -51,6 +95,6 @@ func GetSysctl(sysctl string) (int, error) {
 }
 
 // SetSysctl modifies the specified sysctl flag to the new value
-func SetSysctl(sysctl string, newVal int) error {
+func (*procSysctl) SetSysctl(sysctl string, newVal int) error {
 	return ioutil.WriteFile(path.Join(sysctlBase, sysctl), []byte(strconv.Itoa(newVal)), 0640)
 }

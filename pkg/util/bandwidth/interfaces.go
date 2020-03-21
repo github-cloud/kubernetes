@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,9 +16,11 @@ limitations under the License.
 
 package bandwidth
 
-import "k8s.io/kubernetes/pkg/api/resource"
+import "k8s.io/apimachinery/pkg/api/resource"
 
-type BandwidthShaper interface {
+// Shaper is designed so that the shaper structs created
+// satisfy the Shaper interface.
+type Shaper interface {
 	// Limit the bandwidth for a particular CIDR on a particular interface
 	//   * ingress and egress are in bits/second
 	//   * cidr is expected to be a valid network CIDR (e.g. '1.2.3.4/32' or '10.20.0.1/16')

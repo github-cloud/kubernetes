@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,16 +17,14 @@ limitations under the License.
 package labels
 
 import (
-	"fmt"
-
-	"k8s.io/kubernetes/pkg/api/unversioned"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Clones the given map and returns a new map with the given key and value added.
 // Returns the given map, if labelKey is empty.
-func CloneAndAddLabel(labels map[string]string, labelKey string, labelValue uint32) map[string]string {
+func CloneAndAddLabel(labels map[string]string, labelKey, labelValue string) map[string]string {
 	if labelKey == "" {
-		// Dont need to add a label.
+		// Don't need to add a label.
 		return labels
 	}
 	// Clone.
@@ -34,7 +32,7 @@ func CloneAndAddLabel(labels map[string]string, labelKey string, labelValue uint
 	for key, value := range labels {
 		newLabels[key] = value
 	}
-	newLabels[labelKey] = fmt.Sprintf("%d", labelValue)
+	newLabels[labelKey] = labelValue
 	return newLabels
 }
 
@@ -42,7 +40,7 @@ func CloneAndAddLabel(labels map[string]string, labelKey string, labelValue uint
 // Returns the given map, if labelKey is empty.
 func CloneAndRemoveLabel(labels map[string]string, labelKey string) map[string]string {
 	if labelKey == "" {
-		// Dont need to add a label.
+		// Don't need to add a label.
 		return labels
 	}
 	// Clone.
@@ -54,16 +52,29 @@ func CloneAndRemoveLabel(labels map[string]string, labelKey string) map[string]s
 	return newLabels
 }
 
+// AddLabel returns a map with the given key and value added to the given map.
+func AddLabel(labels map[string]string, labelKey, labelValue string) map[string]string {
+	if labelKey == "" {
+		// Don't need to add a label.
+		return labels
+	}
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[labelKey] = labelValue
+	return labels
+}
+
 // Clones the given selector and returns a new selector with the given key and value added.
 // Returns the given selector, if labelKey is empty.
-func CloneSelectorAndAddLabel(selector *unversioned.LabelSelector, labelKey string, labelValue uint32) *unversioned.LabelSelector {
+func CloneSelectorAndAddLabel(selector *metav1.LabelSelector, labelKey, labelValue string) *metav1.LabelSelector {
 	if labelKey == "" {
-		// Dont need to add a label.
+		// Don't need to add a label.
 		return selector
 	}
 
 	// Clone.
-	newSelector := new(unversioned.LabelSelector)
+	newSelector := new(metav1.LabelSelector)
 
 	// TODO(madhusudancs): Check if you can use deepCopy_extensions_LabelSelector here.
 	newSelector.MatchLabels = make(map[string]string)
@@ -72,10 +83,10 @@ func CloneSelectorAndAddLabel(selector *unversioned.LabelSelector, labelKey stri
 			newSelector.MatchLabels[key] = val
 		}
 	}
-	newSelector.MatchLabels[labelKey] = fmt.Sprintf("%d", labelValue)
+	newSelector.MatchLabels[labelKey] = labelValue
 
 	if selector.MatchExpressions != nil {
-		newMExps := make([]unversioned.LabelSelectorRequirement, len(selector.MatchExpressions))
+		newMExps := make([]metav1.LabelSelectorRequirement, len(selector.MatchExpressions))
 		for i, me := range selector.MatchExpressions {
 			newMExps[i].Key = me.Key
 			newMExps[i].Operator = me.Operator
@@ -92,4 +103,22 @@ func CloneSelectorAndAddLabel(selector *unversioned.LabelSelector, labelKey stri
 	}
 
 	return newSelector
+}
+
+// AddLabelToSelector returns a selector with the given key and value added to the given selector's MatchLabels.
+func AddLabelToSelector(selector *metav1.LabelSelector, labelKey, labelValue string) *metav1.LabelSelector {
+	if labelKey == "" {
+		// Don't need to add a label.
+		return selector
+	}
+	if selector.MatchLabels == nil {
+		selector.MatchLabels = make(map[string]string)
+	}
+	selector.MatchLabels[labelKey] = labelValue
+	return selector
+}
+
+// SelectorHasLabel checks if the given selector contains the given label key in its MatchLabels
+func SelectorHasLabel(selector *metav1.LabelSelector, labelKey string) bool {
+	return len(selector.MatchLabels[labelKey]) > 0
 }

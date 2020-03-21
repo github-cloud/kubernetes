@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,17 +14,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script checks import restrictions. The script looks for a file called
+# `.import-restrictions` in each directory, then all imports of the package are
+# checked against each "rule" in the file.
+# Usage: `hack/verify-import-boss.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
 
-"${KUBE_ROOT}/hack/build-go.sh" cmd/libs/go2idl/import-boss
+make -C "${KUBE_ROOT}" WHAT=vendor/k8s.io/code-generator/cmd/import-boss
 
-"${KUBE_ROOT}/hack/after-build/run-import-boss.sh" --verify-only
+packages=("k8s.io/kubernetes/pkg/..." "k8s.io/kubernetes/cmd/..." "k8s.io/kubernetes/plugin/..." "k8s.io/kubernetes/test/e2e/framework/...")
+for d in staging/src/k8s.io/*/; do
+  if [ -d "$d" ]; then
+    packages+=("./vendor/${d#"staging/src/"}...")
+  fi
+done
+
+$(kube::util::find-binary "import-boss") --verify-only "$@" --input-dirs "$(IFS=, ; echo "${packages[*]}")"

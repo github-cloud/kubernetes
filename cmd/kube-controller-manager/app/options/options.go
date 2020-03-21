@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,129 +16,441 @@ limitations under the License.
 
 // Package options provides the flags used for the controller manager.
 //
-// CAUTION: If you update code in this file, you may need to also update code
-//          in contrib/mesos/pkg/controllermanager/controllermanager.go
 package options
 
 import (
-	"time"
+	"fmt"
+	"net"
 
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/apis/componentconfig"
-	"k8s.io/kubernetes/pkg/client/leaderelection"
+	v1 "k8s.io/api/core/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	apiserveroptions "k8s.io/apiserver/pkg/server/options"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	clientset "k8s.io/client-go/kubernetes"
+	clientgokubescheme "k8s.io/client-go/kubernetes/scheme"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/component-base/metrics"
+	kubectrlmgrconfigv1alpha1 "k8s.io/kube-controller-manager/config/v1alpha1"
+	cmoptions "k8s.io/kubernetes/cmd/controller-manager/app/options"
+	kubecontrollerconfig "k8s.io/kubernetes/cmd/kube-controller-manager/app/config"
+	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
+	kubectrlmgrconfigscheme "k8s.io/kubernetes/pkg/controller/apis/config/scheme"
+	"k8s.io/kubernetes/pkg/controller/garbagecollector"
+	garbagecollectorconfig "k8s.io/kubernetes/pkg/controller/garbagecollector/config"
 	"k8s.io/kubernetes/pkg/master/ports"
 
-	"github.com/spf13/pflag"
+	// add the kubernetes feature gates
+	_ "k8s.io/kubernetes/pkg/features"
+
+	"k8s.io/klog"
 )
 
-// CMServer is the main context object for the controller manager.
-type CMServer struct {
-	componentconfig.KubeControllerManagerConfiguration
+const (
+	// KubeControllerManagerUserAgent is the userAgent name when starting kube-controller managers.
+	KubeControllerManagerUserAgent = "kube-controller-manager"
+)
 
-	Master     string
-	Kubeconfig string
+// KubeControllerManagerOptions is the main context object for the kube-controller manager.
+type KubeControllerManagerOptions struct {
+	Generic           *cmoptions.GenericControllerManagerConfigurationOptions
+	KubeCloudShared   *cmoptions.KubeCloudSharedOptions
+	ServiceController *cmoptions.ServiceControllerOptions
+
+	AttachDetachController           *AttachDetachControllerOptions
+	CSRSigningController             *CSRSigningControllerOptions
+	DaemonSetController              *DaemonSetControllerOptions
+	DeploymentController             *DeploymentControllerOptions
+	StatefulSetController            *StatefulSetControllerOptions
+	DeprecatedFlags                  *DeprecatedControllerOptions
+	EndpointController               *EndpointControllerOptions
+	EndpointSliceController          *EndpointSliceControllerOptions
+	GarbageCollectorController       *GarbageCollectorControllerOptions
+	HPAController                    *HPAControllerOptions
+	JobController                    *JobControllerOptions
+	NamespaceController              *NamespaceControllerOptions
+	NodeIPAMController               *NodeIPAMControllerOptions
+	NodeLifecycleController          *NodeLifecycleControllerOptions
+	PersistentVolumeBinderController *PersistentVolumeBinderControllerOptions
+	PodGCController                  *PodGCControllerOptions
+	ReplicaSetController             *ReplicaSetControllerOptions
+	ReplicationController            *ReplicationControllerOptions
+	ResourceQuotaController          *ResourceQuotaControllerOptions
+	SAController                     *SAControllerOptions
+	TTLAfterFinishedController       *TTLAfterFinishedControllerOptions
+
+	SecureServing *apiserveroptions.SecureServingOptionsWithLoopback
+	// TODO: remove insecure serving mode
+	InsecureServing *apiserveroptions.DeprecatedInsecureServingOptionsWithLoopback
+	Authentication  *apiserveroptions.DelegatingAuthenticationOptions
+	Authorization   *apiserveroptions.DelegatingAuthorizationOptions
+
+	Master                      string
+	Kubeconfig                  string
+	ShowHiddenMetricsForVersion string
 }
 
-// NewCMServer creates a new CMServer with a default config.
-func NewCMServer() *CMServer {
-	s := CMServer{
-		KubeControllerManagerConfiguration: componentconfig.KubeControllerManagerConfiguration{
-			Port:                              ports.ControllerManagerPort,
-			Address:                           "0.0.0.0",
-			ConcurrentEndpointSyncs:           5,
-			ConcurrentRCSyncs:                 5,
-			ConcurrentRSSyncs:                 5,
-			ConcurrentDaemonSetSyncs:          2,
-			ConcurrentJobSyncs:                5,
-			ConcurrentResourceQuotaSyncs:      5,
-			ConcurrentDeploymentSyncs:         5,
-			ConcurrentNamespaceSyncs:          2,
-			ServiceSyncPeriod:                 unversioned.Duration{5 * time.Minute},
-			NodeSyncPeriod:                    unversioned.Duration{10 * time.Second},
-			ResourceQuotaSyncPeriod:           unversioned.Duration{5 * time.Minute},
-			NamespaceSyncPeriod:               unversioned.Duration{5 * time.Minute},
-			PVClaimBinderSyncPeriod:           unversioned.Duration{10 * time.Minute},
-			HorizontalPodAutoscalerSyncPeriod: unversioned.Duration{30 * time.Second},
-			DeploymentControllerSyncPeriod:    unversioned.Duration{30 * time.Second},
-			MinResyncPeriod:                   unversioned.Duration{12 * time.Hour},
-			RegisterRetryCount:                10,
-			PodEvictionTimeout:                unversioned.Duration{5 * time.Minute},
-			NodeMonitorGracePeriod:            unversioned.Duration{40 * time.Second},
-			NodeStartupGracePeriod:            unversioned.Duration{60 * time.Second},
-			NodeMonitorPeriod:                 unversioned.Duration{5 * time.Second},
-			ClusterName:                       "kubernetes",
-			TerminatedPodGCThreshold:          12500,
-			VolumeConfiguration: componentconfig.VolumeConfiguration{
-				EnableHostPathProvisioning: false,
-				PersistentVolumeRecyclerConfiguration: componentconfig.PersistentVolumeRecyclerConfiguration{
-					MaximumRetry:             3,
-					MinimumTimeoutNFS:        300,
-					IncrementTimeoutNFS:      30,
-					MinimumTimeoutHostPath:   60,
-					IncrementTimeoutHostPath: 30,
-				},
-			},
-			KubeAPIQPS:     20.0,
-			KubeAPIBurst:   30,
-			LeaderElection: leaderelection.DefaultLeaderElectionConfiguration(),
-		},
+// NewKubeControllerManagerOptions creates a new KubeControllerManagerOptions with a default config.
+func NewKubeControllerManagerOptions() (*KubeControllerManagerOptions, error) {
+	componentConfig, err := NewDefaultComponentConfig(ports.InsecureKubeControllerManagerPort)
+	if err != nil {
+		return nil, err
 	}
-	return &s
+
+	s := KubeControllerManagerOptions{
+		Generic:         cmoptions.NewGenericControllerManagerConfigurationOptions(&componentConfig.Generic),
+		KubeCloudShared: cmoptions.NewKubeCloudSharedOptions(&componentConfig.KubeCloudShared),
+		ServiceController: &cmoptions.ServiceControllerOptions{
+			ServiceControllerConfiguration: &componentConfig.ServiceController,
+		},
+		AttachDetachController: &AttachDetachControllerOptions{
+			&componentConfig.AttachDetachController,
+		},
+		CSRSigningController: &CSRSigningControllerOptions{
+			&componentConfig.CSRSigningController,
+		},
+		DaemonSetController: &DaemonSetControllerOptions{
+			&componentConfig.DaemonSetController,
+		},
+		DeploymentController: &DeploymentControllerOptions{
+			&componentConfig.DeploymentController,
+		},
+		StatefulSetController: &StatefulSetControllerOptions{
+			&componentConfig.StatefulSetController,
+		},
+		DeprecatedFlags: &DeprecatedControllerOptions{
+			&componentConfig.DeprecatedController,
+		},
+		EndpointController: &EndpointControllerOptions{
+			&componentConfig.EndpointController,
+		},
+		EndpointSliceController: &EndpointSliceControllerOptions{
+			&componentConfig.EndpointSliceController,
+		},
+		GarbageCollectorController: &GarbageCollectorControllerOptions{
+			&componentConfig.GarbageCollectorController,
+		},
+		HPAController: &HPAControllerOptions{
+			&componentConfig.HPAController,
+		},
+		JobController: &JobControllerOptions{
+			&componentConfig.JobController,
+		},
+		NamespaceController: &NamespaceControllerOptions{
+			&componentConfig.NamespaceController,
+		},
+		NodeIPAMController: &NodeIPAMControllerOptions{
+			&componentConfig.NodeIPAMController,
+		},
+		NodeLifecycleController: &NodeLifecycleControllerOptions{
+			&componentConfig.NodeLifecycleController,
+		},
+		PersistentVolumeBinderController: &PersistentVolumeBinderControllerOptions{
+			&componentConfig.PersistentVolumeBinderController,
+		},
+		PodGCController: &PodGCControllerOptions{
+			&componentConfig.PodGCController,
+		},
+		ReplicaSetController: &ReplicaSetControllerOptions{
+			&componentConfig.ReplicaSetController,
+		},
+		ReplicationController: &ReplicationControllerOptions{
+			&componentConfig.ReplicationController,
+		},
+		ResourceQuotaController: &ResourceQuotaControllerOptions{
+			&componentConfig.ResourceQuotaController,
+		},
+		SAController: &SAControllerOptions{
+			&componentConfig.SAController,
+		},
+		TTLAfterFinishedController: &TTLAfterFinishedControllerOptions{
+			&componentConfig.TTLAfterFinishedController,
+		},
+		SecureServing: apiserveroptions.NewSecureServingOptions().WithLoopback(),
+		InsecureServing: (&apiserveroptions.DeprecatedInsecureServingOptions{
+			BindAddress: net.ParseIP(componentConfig.Generic.Address),
+			BindPort:    int(componentConfig.Generic.Port),
+			BindNetwork: "tcp",
+		}).WithLoopback(),
+		Authentication: apiserveroptions.NewDelegatingAuthenticationOptions(),
+		Authorization:  apiserveroptions.NewDelegatingAuthorizationOptions(),
+	}
+
+	s.Authentication.RemoteKubeConfigFileOptional = true
+	s.Authorization.RemoteKubeConfigFileOptional = true
+	s.Authorization.AlwaysAllowPaths = []string{"/healthz"}
+
+	// Set the PairName but leave certificate directory blank to generate in-memory by default
+	s.SecureServing.ServerCert.CertDirectory = ""
+	s.SecureServing.ServerCert.PairName = "kube-controller-manager"
+	s.SecureServing.BindPort = ports.KubeControllerManagerPort
+
+	gcIgnoredResources := make([]garbagecollectorconfig.GroupResource, 0, len(garbagecollector.DefaultIgnoredResources()))
+	for r := range garbagecollector.DefaultIgnoredResources() {
+		gcIgnoredResources = append(gcIgnoredResources, garbagecollectorconfig.GroupResource{Group: r.Group, Resource: r.Resource})
+	}
+
+	s.GarbageCollectorController.GCIgnoredResources = gcIgnoredResources
+	s.Generic.LeaderElection.ResourceName = "kube-controller-manager"
+	s.Generic.LeaderElection.ResourceNamespace = "kube-system"
+
+	return &s, nil
 }
 
-// AddFlags adds flags for a specific CMServer to the specified FlagSet
-func (s *CMServer) AddFlags(fs *pflag.FlagSet) {
-	fs.IntVar(&s.Port, "port", s.Port, "The port that the controller-manager's http service runs on")
-	fs.Var(componentconfig.IPVar{&s.Address}, "address", "The IP address to serve on (set to 0.0.0.0 for all interfaces)")
-	fs.StringVar(&s.CloudProvider, "cloud-provider", s.CloudProvider, "The provider for cloud services.  Empty string for no provider.")
-	fs.StringVar(&s.CloudConfigFile, "cloud-config", s.CloudConfigFile, "The path to the cloud provider configuration file.  Empty string for no configuration file.")
-	fs.IntVar(&s.ConcurrentEndpointSyncs, "concurrent-endpoint-syncs", s.ConcurrentEndpointSyncs, "The number of endpoint syncing operations that will be done concurrently. Larger number = faster endpoint updating, but more CPU (and network) load")
-	fs.IntVar(&s.ConcurrentRCSyncs, "concurrent_rc_syncs", s.ConcurrentRCSyncs, "The number of replication controllers that are allowed to sync concurrently. Larger number = more responsive replica management, but more CPU (and network) load")
-	fs.IntVar(&s.ConcurrentRSSyncs, "concurrent-replicaset-syncs", s.ConcurrentRSSyncs, "The number of replica sets that are allowed to sync concurrently. Larger number = more responsive replica management, but more CPU (and network) load")
-	fs.IntVar(&s.ConcurrentResourceQuotaSyncs, "concurrent-resource-quota-syncs", s.ConcurrentResourceQuotaSyncs, "The number of resource quotas that are allowed to sync concurrently. Larger number = more responsive quota management, but more CPU (and network) load")
-	fs.IntVar(&s.ConcurrentDeploymentSyncs, "concurrent-deployment-syncs", s.ConcurrentDeploymentSyncs, "The number of deployment objects that are allowed to sync concurrently. Larger number = more responsive deployments, but more CPU (and network) load")
-	fs.IntVar(&s.ConcurrentNamespaceSyncs, "concurrent-namespace-syncs", s.ConcurrentNamespaceSyncs, "The number of namespace objects that are allowed to sync concurrently. Larger number = more responsive namespace termination, but more CPU (and network) load")
-	fs.DurationVar(&s.ServiceSyncPeriod.Duration, "service-sync-period", s.ServiceSyncPeriod.Duration, "The period for syncing services with their external load balancers")
-	fs.DurationVar(&s.NodeSyncPeriod.Duration, "node-sync-period", s.NodeSyncPeriod.Duration, ""+
-		"The period for syncing nodes from cloudprovider. Longer periods will result in "+
-		"fewer calls to cloud provider, but may delay addition of new nodes to cluster.")
-	fs.DurationVar(&s.ResourceQuotaSyncPeriod.Duration, "resource-quota-sync-period", s.ResourceQuotaSyncPeriod.Duration, "The period for syncing quota usage status in the system")
-	fs.DurationVar(&s.NamespaceSyncPeriod.Duration, "namespace-sync-period", s.NamespaceSyncPeriod.Duration, "The period for syncing namespace life-cycle updates")
-	fs.DurationVar(&s.PVClaimBinderSyncPeriod.Duration, "pvclaimbinder-sync-period", s.PVClaimBinderSyncPeriod.Duration, "The period for syncing persistent volumes and persistent volume claims")
-	fs.DurationVar(&s.MinResyncPeriod.Duration, "min-resync-period", s.MinResyncPeriod.Duration, "The resync period in reflectors will be random between MinResyncPeriod and 2*MinResyncPeriod")
-	fs.StringVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.PodTemplateFilePathNFS, "pv-recycler-pod-template-filepath-nfs", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.PodTemplateFilePathNFS, "The file path to a pod definition used as a template for NFS persistent volume recycling")
-	fs.IntVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.MinimumTimeoutNFS, "pv-recycler-minimum-timeout-nfs", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.MinimumTimeoutNFS, "The minimum ActiveDeadlineSeconds to use for an NFS Recycler pod")
-	fs.IntVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.IncrementTimeoutNFS, "pv-recycler-increment-timeout-nfs", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.IncrementTimeoutNFS, "the increment of time added per Gi to ActiveDeadlineSeconds for an NFS scrubber pod")
-	fs.StringVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.PodTemplateFilePathHostPath, "pv-recycler-pod-template-filepath-hostpath", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.PodTemplateFilePathHostPath, "The file path to a pod definition used as a template for HostPath persistent volume recycling. This is for development and testing only and will not work in a multi-node cluster.")
-	fs.IntVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.MinimumTimeoutHostPath, "pv-recycler-minimum-timeout-hostpath", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.MinimumTimeoutHostPath, "The minimum ActiveDeadlineSeconds to use for a HostPath Recycler pod.  This is for development and testing only and will not work in a multi-node cluster.")
-	fs.IntVar(&s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.IncrementTimeoutHostPath, "pv-recycler-timeout-increment-hostpath", s.VolumeConfiguration.PersistentVolumeRecyclerConfiguration.IncrementTimeoutHostPath, "the increment of time added per Gi to ActiveDeadlineSeconds for a HostPath scrubber pod.  This is for development and testing only and will not work in a multi-node cluster.")
-	fs.BoolVar(&s.VolumeConfiguration.EnableHostPathProvisioning, "enable-hostpath-provisioner", s.VolumeConfiguration.EnableHostPathProvisioning, "Enable HostPath PV provisioning when running without a cloud provider. This allows testing and development of provisioning features.  HostPath provisioning is not supported in any way, won't work in a multi-node cluster, and should not be used for anything other than testing or development.")
-	fs.IntVar(&s.TerminatedPodGCThreshold, "terminated-pod-gc-threshold", s.TerminatedPodGCThreshold, "Number of terminated pods that can exist before the terminated pod garbage collector starts deleting terminated pods. If <= 0, the terminated pod garbage collector is disabled.")
-	fs.DurationVar(&s.HorizontalPodAutoscalerSyncPeriod.Duration, "horizontal-pod-autoscaler-sync-period", s.HorizontalPodAutoscalerSyncPeriod.Duration, "The period for syncing the number of pods in horizontal pod autoscaler.")
-	fs.DurationVar(&s.DeploymentControllerSyncPeriod.Duration, "deployment-controller-sync-period", s.DeploymentControllerSyncPeriod.Duration, "Period for syncing the deployments.")
-	fs.DurationVar(&s.PodEvictionTimeout.Duration, "pod-eviction-timeout", s.PodEvictionTimeout.Duration, "The grace period for deleting pods on failed nodes.")
-	fs.Float32Var(&s.DeletingPodsQps, "deleting-pods-qps", 0.1, "Number of nodes per second on which pods are deleted in case of node failure.")
-	fs.IntVar(&s.DeletingPodsBurst, "deleting-pods-burst", 10, "Number of nodes on which pods are bursty deleted in case of node failure. For more details look into RateLimiter.")
-	fs.IntVar(&s.RegisterRetryCount, "register-retry-count", s.RegisterRetryCount, ""+
-		"The number of retries for initial node registration.  Retry interval equals node-sync-period.")
-	fs.MarkDeprecated("register-retry-count", "This flag is currently no-op and will be deleted.")
-	fs.DurationVar(&s.NodeMonitorGracePeriod.Duration, "node-monitor-grace-period", s.NodeMonitorGracePeriod.Duration,
-		"Amount of time which we allow running Node to be unresponsive before marking it unhealty. "+
-			"Must be N times more than kubelet's nodeStatusUpdateFrequency, "+
-			"where N means number of retries allowed for kubelet to post node status.")
-	fs.DurationVar(&s.NodeStartupGracePeriod.Duration, "node-startup-grace-period", s.NodeStartupGracePeriod.Duration,
-		"Amount of time which we allow starting Node to be unresponsive before marking it unhealty.")
-	fs.DurationVar(&s.NodeMonitorPeriod.Duration, "node-monitor-period", s.NodeMonitorPeriod.Duration,
-		"The period for syncing NodeStatus in NodeController.")
-	fs.StringVar(&s.ServiceAccountKeyFile, "service-account-private-key-file", s.ServiceAccountKeyFile, "Filename containing a PEM-encoded private RSA key used to sign service account tokens.")
-	fs.BoolVar(&s.EnableProfiling, "profiling", true, "Enable profiling via web interface host:port/debug/pprof/")
-	fs.StringVar(&s.ClusterName, "cluster-name", s.ClusterName, "The instance prefix for the cluster")
-	fs.StringVar(&s.ClusterCIDR, "cluster-cidr", s.ClusterCIDR, "CIDR Range for Pods in cluster.")
-	fs.BoolVar(&s.AllocateNodeCIDRs, "allocate-node-cidrs", false, "Should CIDRs for Pods be allocated and set on the cloud provider.")
-	fs.StringVar(&s.Master, "master", s.Master, "The address of the Kubernetes API server (overrides any value in kubeconfig)")
+// NewDefaultComponentConfig returns kube-controller manager configuration object.
+func NewDefaultComponentConfig(insecurePort int32) (kubectrlmgrconfig.KubeControllerManagerConfiguration, error) {
+	versioned := kubectrlmgrconfigv1alpha1.KubeControllerManagerConfiguration{}
+	kubectrlmgrconfigscheme.Scheme.Default(&versioned)
+
+	internal := kubectrlmgrconfig.KubeControllerManagerConfiguration{}
+	if err := kubectrlmgrconfigscheme.Scheme.Convert(&versioned, &internal, nil); err != nil {
+		return internal, err
+	}
+	internal.Generic.Port = insecurePort
+	return internal, nil
+}
+
+// Flags returns flags for a specific APIServer by section name
+func (s *KubeControllerManagerOptions) Flags(allControllers []string, disabledByDefaultControllers []string) cliflag.NamedFlagSets {
+	fss := cliflag.NamedFlagSets{}
+	s.Generic.AddFlags(&fss, allControllers, disabledByDefaultControllers)
+	s.KubeCloudShared.AddFlags(fss.FlagSet("generic"))
+	s.ServiceController.AddFlags(fss.FlagSet("service controller"))
+
+	s.SecureServing.AddFlags(fss.FlagSet("secure serving"))
+	s.InsecureServing.AddUnqualifiedFlags(fss.FlagSet("insecure serving"))
+	s.Authentication.AddFlags(fss.FlagSet("authentication"))
+	s.Authorization.AddFlags(fss.FlagSet("authorization"))
+
+	s.AttachDetachController.AddFlags(fss.FlagSet("attachdetach controller"))
+	s.CSRSigningController.AddFlags(fss.FlagSet("csrsigning controller"))
+	s.DeploymentController.AddFlags(fss.FlagSet("deployment controller"))
+	s.StatefulSetController.AddFlags(fss.FlagSet("statefulset controller"))
+	s.DaemonSetController.AddFlags(fss.FlagSet("daemonset controller"))
+	s.DeprecatedFlags.AddFlags(fss.FlagSet("deprecated"))
+	s.EndpointController.AddFlags(fss.FlagSet("endpoint controller"))
+	s.EndpointSliceController.AddFlags(fss.FlagSet("endpointslice controller"))
+	s.GarbageCollectorController.AddFlags(fss.FlagSet("garbagecollector controller"))
+	s.HPAController.AddFlags(fss.FlagSet("horizontalpodautoscaling controller"))
+	s.JobController.AddFlags(fss.FlagSet("job controller"))
+	s.NamespaceController.AddFlags(fss.FlagSet("namespace controller"))
+	s.NodeIPAMController.AddFlags(fss.FlagSet("nodeipam controller"))
+	s.NodeLifecycleController.AddFlags(fss.FlagSet("nodelifecycle controller"))
+	s.PersistentVolumeBinderController.AddFlags(fss.FlagSet("persistentvolume-binder controller"))
+	s.PodGCController.AddFlags(fss.FlagSet("podgc controller"))
+	s.ReplicaSetController.AddFlags(fss.FlagSet("replicaset controller"))
+	s.ReplicationController.AddFlags(fss.FlagSet("replicationcontroller"))
+	s.ResourceQuotaController.AddFlags(fss.FlagSet("resourcequota controller"))
+	s.SAController.AddFlags(fss.FlagSet("serviceaccount controller"))
+	s.TTLAfterFinishedController.AddFlags(fss.FlagSet("ttl-after-finished controller"))
+
+	fs := fss.FlagSet("misc")
+	fs.StringVar(&s.Master, "master", s.Master, "The address of the Kubernetes API server (overrides any value in kubeconfig).")
 	fs.StringVar(&s.Kubeconfig, "kubeconfig", s.Kubeconfig, "Path to kubeconfig file with authorization and master location information.")
-	fs.StringVar(&s.RootCAFile, "root-ca-file", s.RootCAFile, "If set, this root certificate authority will be included in service account's token secret. This must be a valid PEM-encoded CA bundle.")
-	fs.Float32Var(&s.KubeAPIQPS, "kube-api-qps", s.KubeAPIQPS, "QPS to use while talking with kubernetes apiserver")
-	fs.IntVar(&s.KubeAPIBurst, "kube-api-burst", s.KubeAPIBurst, "Burst to use while talking with kubernetes apiserver")
-	leaderelection.BindFlags(&s.LeaderElection, fs)
+	utilfeature.DefaultMutableFeatureGate.AddFlag(fss.FlagSet("generic"))
+
+	mfs := fss.FlagSet("metrics")
+	mfs.StringVar(&s.ShowHiddenMetricsForVersion, "show-hidden-metrics-for-version", s.ShowHiddenMetricsForVersion,
+		"The previous version for which you want to show hidden metrics. "+
+			"Only the previous minor version is meaningful, other values will not be allowed. "+
+			"The format is <major>.<minor>, e.g.: '1.16'. "+
+			"The purpose of this format is make sure you have the opportunity to notice if the next release hides additional metrics, "+
+			"rather than being surprised when they are permanently removed in the release after that.")
+
+	return fss
+}
+
+// ApplyTo fills up controller manager config with options.
+func (s *KubeControllerManagerOptions) ApplyTo(c *kubecontrollerconfig.Config) error {
+	if err := s.Generic.ApplyTo(&c.ComponentConfig.Generic); err != nil {
+		return err
+	}
+	if err := s.KubeCloudShared.ApplyTo(&c.ComponentConfig.KubeCloudShared); err != nil {
+		return err
+	}
+	if err := s.AttachDetachController.ApplyTo(&c.ComponentConfig.AttachDetachController); err != nil {
+		return err
+	}
+	if err := s.CSRSigningController.ApplyTo(&c.ComponentConfig.CSRSigningController); err != nil {
+		return err
+	}
+	if err := s.DaemonSetController.ApplyTo(&c.ComponentConfig.DaemonSetController); err != nil {
+		return err
+	}
+	if err := s.DeploymentController.ApplyTo(&c.ComponentConfig.DeploymentController); err != nil {
+		return err
+	}
+	if err := s.StatefulSetController.ApplyTo(&c.ComponentConfig.StatefulSetController); err != nil {
+		return err
+	}
+	if err := s.DeprecatedFlags.ApplyTo(&c.ComponentConfig.DeprecatedController); err != nil {
+		return err
+	}
+	if err := s.EndpointController.ApplyTo(&c.ComponentConfig.EndpointController); err != nil {
+		return err
+	}
+	if err := s.EndpointSliceController.ApplyTo(&c.ComponentConfig.EndpointSliceController); err != nil {
+		return err
+	}
+	if err := s.GarbageCollectorController.ApplyTo(&c.ComponentConfig.GarbageCollectorController); err != nil {
+		return err
+	}
+	if err := s.HPAController.ApplyTo(&c.ComponentConfig.HPAController); err != nil {
+		return err
+	}
+	if err := s.JobController.ApplyTo(&c.ComponentConfig.JobController); err != nil {
+		return err
+	}
+	if err := s.NamespaceController.ApplyTo(&c.ComponentConfig.NamespaceController); err != nil {
+		return err
+	}
+	if err := s.NodeIPAMController.ApplyTo(&c.ComponentConfig.NodeIPAMController); err != nil {
+		return err
+	}
+	if err := s.NodeLifecycleController.ApplyTo(&c.ComponentConfig.NodeLifecycleController); err != nil {
+		return err
+	}
+	if err := s.PersistentVolumeBinderController.ApplyTo(&c.ComponentConfig.PersistentVolumeBinderController); err != nil {
+		return err
+	}
+	if err := s.PodGCController.ApplyTo(&c.ComponentConfig.PodGCController); err != nil {
+		return err
+	}
+	if err := s.ReplicaSetController.ApplyTo(&c.ComponentConfig.ReplicaSetController); err != nil {
+		return err
+	}
+	if err := s.ReplicationController.ApplyTo(&c.ComponentConfig.ReplicationController); err != nil {
+		return err
+	}
+	if err := s.ResourceQuotaController.ApplyTo(&c.ComponentConfig.ResourceQuotaController); err != nil {
+		return err
+	}
+	if err := s.SAController.ApplyTo(&c.ComponentConfig.SAController); err != nil {
+		return err
+	}
+	if err := s.ServiceController.ApplyTo(&c.ComponentConfig.ServiceController); err != nil {
+		return err
+	}
+	if err := s.TTLAfterFinishedController.ApplyTo(&c.ComponentConfig.TTLAfterFinishedController); err != nil {
+		return err
+	}
+	if err := s.InsecureServing.ApplyTo(&c.InsecureServing, &c.LoopbackClientConfig); err != nil {
+		return err
+	}
+	if err := s.SecureServing.ApplyTo(&c.SecureServing, &c.LoopbackClientConfig); err != nil {
+		return err
+	}
+	if s.SecureServing.BindPort != 0 || s.SecureServing.Listener != nil {
+		if err := s.Authentication.ApplyTo(&c.Authentication, c.SecureServing, nil); err != nil {
+			return err
+		}
+		if err := s.Authorization.ApplyTo(&c.Authorization); err != nil {
+			return err
+		}
+	}
+
+	// sync back to component config
+	// TODO: find more elegant way than syncing back the values.
+	c.ComponentConfig.Generic.Port = int32(s.InsecureServing.BindPort)
+	c.ComponentConfig.Generic.Address = s.InsecureServing.BindAddress.String()
+
+	return nil
+}
+
+// Validate is used to validate the options and config before launching the controller manager
+func (s *KubeControllerManagerOptions) Validate(allControllers []string, disabledByDefaultControllers []string) error {
+	var errs []error
+
+	errs = append(errs, s.Generic.Validate(allControllers, disabledByDefaultControllers)...)
+	errs = append(errs, s.KubeCloudShared.Validate()...)
+	errs = append(errs, s.AttachDetachController.Validate()...)
+	errs = append(errs, s.CSRSigningController.Validate()...)
+	errs = append(errs, s.DaemonSetController.Validate()...)
+	errs = append(errs, s.DeploymentController.Validate()...)
+	errs = append(errs, s.StatefulSetController.Validate()...)
+	errs = append(errs, s.DeprecatedFlags.Validate()...)
+	errs = append(errs, s.EndpointController.Validate()...)
+	errs = append(errs, s.EndpointSliceController.Validate()...)
+	errs = append(errs, s.GarbageCollectorController.Validate()...)
+	errs = append(errs, s.HPAController.Validate()...)
+	errs = append(errs, s.JobController.Validate()...)
+	errs = append(errs, s.NamespaceController.Validate()...)
+	errs = append(errs, s.NodeIPAMController.Validate()...)
+	errs = append(errs, s.NodeLifecycleController.Validate()...)
+	errs = append(errs, s.PersistentVolumeBinderController.Validate()...)
+	errs = append(errs, s.PodGCController.Validate()...)
+	errs = append(errs, s.ReplicaSetController.Validate()...)
+	errs = append(errs, s.ReplicationController.Validate()...)
+	errs = append(errs, s.ResourceQuotaController.Validate()...)
+	errs = append(errs, s.SAController.Validate()...)
+	errs = append(errs, s.ServiceController.Validate()...)
+	errs = append(errs, s.TTLAfterFinishedController.Validate()...)
+	errs = append(errs, s.SecureServing.Validate()...)
+	errs = append(errs, s.InsecureServing.Validate()...)
+	errs = append(errs, s.Authentication.Validate()...)
+	errs = append(errs, s.Authorization.Validate()...)
+	errs = append(errs, metrics.ValidateShowHiddenMetricsVersion(s.ShowHiddenMetricsForVersion)...)
+
+	// TODO: validate component config, master and kubeconfig
+
+	return utilerrors.NewAggregate(errs)
+}
+
+// Config return a controller manager config objective
+func (s KubeControllerManagerOptions) Config(allControllers []string, disabledByDefaultControllers []string) (*kubecontrollerconfig.Config, error) {
+	if err := s.Validate(allControllers, disabledByDefaultControllers); err != nil {
+		return nil, err
+	}
+
+	if err := s.SecureServing.MaybeDefaultWithSelfSignedCerts("localhost", nil, []net.IP{net.ParseIP("127.0.0.1")}); err != nil {
+		return nil, fmt.Errorf("error creating self-signed certificates: %v", err)
+	}
+
+	kubeconfig, err := clientcmd.BuildConfigFromFlags(s.Master, s.Kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	kubeconfig.DisableCompression = true
+	kubeconfig.ContentConfig.AcceptContentTypes = s.Generic.ClientConnection.AcceptContentTypes
+	kubeconfig.ContentConfig.ContentType = s.Generic.ClientConnection.ContentType
+	kubeconfig.QPS = s.Generic.ClientConnection.QPS
+	kubeconfig.Burst = int(s.Generic.ClientConnection.Burst)
+
+	client, err := clientset.NewForConfig(restclient.AddUserAgent(kubeconfig, KubeControllerManagerUserAgent))
+	if err != nil {
+		return nil, err
+	}
+
+	// shallow copy, do not modify the kubeconfig.Timeout.
+	config := *kubeconfig
+	config.Timeout = s.Generic.LeaderElection.RenewDeadline.Duration
+	leaderElectionClient := clientset.NewForConfigOrDie(restclient.AddUserAgent(&config, "leader-election"))
+
+	eventRecorder := createRecorder(client, KubeControllerManagerUserAgent)
+
+	c := &kubecontrollerconfig.Config{
+		Client:               client,
+		Kubeconfig:           kubeconfig,
+		EventRecorder:        eventRecorder,
+		LeaderElectionClient: leaderElectionClient,
+	}
+	if err := s.ApplyTo(c); err != nil {
+		return nil, err
+	}
+
+	if len(s.ShowHiddenMetricsForVersion) > 0 {
+		metrics.SetShowHidden()
+	}
+
+	return c, nil
+}
+
+func createRecorder(kubeClient clientset.Interface, userAgent string) record.EventRecorder {
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(klog.Infof)
+	eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+	return eventBroadcaster.NewRecorder(clientgokubescheme.Scheme, v1.EventSource{Component: userAgent})
 }

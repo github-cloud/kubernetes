@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ limitations under the License.
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -26,10 +27,10 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/util/wait"
-
-	"github.com/golang/glog"
 	"golang.org/x/crypto/ssh"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog"
 )
 
 type testSSHServer struct {
@@ -93,11 +94,11 @@ func runTestSSHServer(user, password string) (*testSSHServer, error) {
 
 		conn, err := listener.Accept()
 		if err != nil {
-			glog.Errorf("Failed to accept: %v", err)
+			klog.Errorf("Failed to accept: %v", err)
 		}
 		_, chans, reqs, err := ssh.NewServerConn(conn, config)
 		if err != nil {
-			glog.Errorf("Failed handshake: %v", err)
+			klog.Errorf("Failed handshake: %v", err)
 		}
 		go ssh.DiscardRequests(reqs)
 		for newChannel := range chans {
@@ -107,11 +108,11 @@ func runTestSSHServer(user, password string) (*testSSHServer, error) {
 			}
 			channel, requests, err := newChannel.Accept()
 			if err != nil {
-				glog.Errorf("Failed to accept channel: %v", err)
+				klog.Errorf("Failed to accept channel: %v", err)
 			}
 
 			for req := range requests {
-				glog.Infof("Got request: %v", req)
+				klog.Infof("Got request: %v", req)
 			}
 
 			channel.Close()
@@ -133,7 +134,7 @@ func TestSSHTunnel(t *testing.T) {
 	}
 
 	privateData := EncodePrivateKey(private)
-	tunnel, err := NewSSHTunnelFromBytes("foo", privateData, server.Host)
+	tunnel, err := newSSHTunnelFromBytes("foo", privateData, server.Host)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 		t.FailNow()
@@ -145,7 +146,7 @@ func TestSSHTunnel(t *testing.T) {
 		t.FailNow()
 	}
 
-	_, err = tunnel.Dial("tcp", "127.0.0.1:8080")
+	_, err = tunnel.Dial(context.Background(), "tcp", "127.0.0.1:8080")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -176,13 +177,13 @@ func (*fakeTunnel) Close() error {
 	return nil
 }
 
-func (*fakeTunnel) Dial(network, address string) (net.Conn, error) {
+func (*fakeTunnel) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	return nil, nil
 }
 
 type fakeTunnelCreator struct{}
 
-func (*fakeTunnelCreator) NewSSHTunnel(string, string, string) (tunnel, error) {
+func (*fakeTunnelCreator) newSSHTunnel(string, string, string) (tunnel, error) {
 	return &fakeTunnel{}, nil
 }
 
@@ -327,4 +328,38 @@ func TestSSHUser(t *testing.T) {
 
 	}
 
+}
+
+func TestTimeoutDialer(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		t.FailNow()
+	}
+
+	testCases := []struct {
+		timeout           time.Duration
+		expectedErrString string
+	}{
+		// delay > timeout should cause ssh.Dial to timeout.
+		{1, "i/o timeout"},
+	}
+	for _, tc := range testCases {
+		dialer := &timeoutDialer{&realSSHDialer{}, tc.timeout}
+		_, err := dialer.Dial("tcp", listener.Addr().String(), &ssh.ClientConfig{})
+		if len(tc.expectedErrString) == 0 && err != nil ||
+			!strings.Contains(fmt.Sprint(err), tc.expectedErrString) {
+			t.Errorf("Expected error to contain %q; got %v", tc.expectedErrString, err)
+		}
+	}
+
+	listener.Close()
+}
+
+func newSSHTunnelFromBytes(user string, privateKey []byte, host string) (*sshTunnel, error) {
+	signer, err := MakePrivateKeySignerFromBytes(privateKey)
+	if err != nil {
+		return nil, err
+	}
+	return makeSSHTunnel(user, signer, host)
 }

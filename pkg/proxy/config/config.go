@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,283 +17,484 @@ limitations under the License.
 package config
 
 import (
-	"sync"
+	"fmt"
+	"time"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/config"
+	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1beta1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	discoveryinformers "k8s.io/client-go/informers/discovery/v1beta1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog"
 )
 
-// Operation is a type of operation of services or endpoints.
-type Operation int
-
-// These are the available operation types.
-const (
-	SET Operation = iota
-	ADD
-	REMOVE
-)
-
-// ServiceUpdate describes an operation of services, sent on the channel.
-// You can add or remove single services by sending an array of size one and Op == ADD|REMOVE.
-// For setting the state of the system to a given state for this source configuration, set Services as desired and Op to SET,
-// which will reset the system state to that specified in this operation for this source channel.
-// To remove all services, set Services to empty array and Op to SET
-type ServiceUpdate struct {
-	Services []api.Service
-	Op       Operation
+// ServiceHandler is an abstract interface of objects which receive
+// notifications about service object changes.
+type ServiceHandler interface {
+	// OnServiceAdd is called whenever creation of new service object
+	// is observed.
+	OnServiceAdd(service *v1.Service)
+	// OnServiceUpdate is called whenever modification of an existing
+	// service object is observed.
+	OnServiceUpdate(oldService, service *v1.Service)
+	// OnServiceDelete is called whenever deletion of an existing service
+	// object is observed.
+	OnServiceDelete(service *v1.Service)
+	// OnServiceSynced is called once all the initial event handlers were
+	// called and the state is fully propagated to local cache.
+	OnServiceSynced()
 }
 
-// EndpointsUpdate describes an operation of endpoints, sent on the channel.
-// You can add or remove single endpoints by sending an array of size one and Op == ADD|REMOVE.
-// For setting the state of the system to a given state for this source configuration, set Endpoints as desired and Op to SET,
-// which will reset the system state to that specified in this operation for this source channel.
-// To remove all endpoints, set Endpoints to empty array and Op to SET
-type EndpointsUpdate struct {
-	Endpoints []api.Endpoints
-	Op        Operation
+// EndpointsHandler is an abstract interface of objects which receive
+// notifications about endpoints object changes.
+type EndpointsHandler interface {
+	// OnEndpointsAdd is called whenever creation of new endpoints object
+	// is observed.
+	OnEndpointsAdd(endpoints *v1.Endpoints)
+	// OnEndpointsUpdate is called whenever modification of an existing
+	// endpoints object is observed.
+	OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints)
+	// OnEndpointsDelete is called whenever deletion of an existing endpoints
+	// object is observed.
+	OnEndpointsDelete(endpoints *v1.Endpoints)
+	// OnEndpointsSynced is called once all the initial event handlers were
+	// called and the state is fully propagated to local cache.
+	OnEndpointsSynced()
 }
 
-// ServiceConfigHandler is an abstract interface of objects which receive update notifications for the set of services.
-type ServiceConfigHandler interface {
-	// OnServiceUpdate gets called when a configuration has been changed by one of the sources.
-	// This is the union of all the configuration sources.
-	OnServiceUpdate(services []api.Service)
+// EndpointSliceHandler is an abstract interface of objects which receive
+// notifications about endpoint slice object changes.
+type EndpointSliceHandler interface {
+	// OnEndpointSliceAdd is called whenever creation of new endpoint slice
+	// object is observed.
+	OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlice)
+	// OnEndpointSliceUpdate is called whenever modification of an existing
+	// endpoint slice object is observed.
+	OnEndpointSliceUpdate(oldEndpointSlice, newEndpointSlice *discovery.EndpointSlice)
+	// OnEndpointSliceDelete is called whenever deletion of an existing
+	// endpoint slice object is observed.
+	OnEndpointSliceDelete(endpointSlice *discovery.EndpointSlice)
+	// OnEndpointSlicesSynced is called once all the initial event handlers were
+	// called and the state is fully propagated to local cache.
+	OnEndpointSlicesSynced()
 }
 
-// EndpointsConfigHandler is an abstract interface of objects which receive update notifications for the set of endpoints.
-type EndpointsConfigHandler interface {
-	// OnEndpointsUpdate gets called when endpoints configuration is changed for a given
-	// service on any of the configuration sources. An example is when a new
-	// service comes up, or when containers come up or down for an existing service.
-	OnEndpointsUpdate(endpoints []api.Endpoints)
+// NoopEndpointSliceHandler is a noop handler for proxiers that have not yet
+// implemented a full EndpointSliceHandler.
+type NoopEndpointSliceHandler struct{}
+
+// OnEndpointSliceAdd is a noop handler for EndpointSlice creates.
+func (*NoopEndpointSliceHandler) OnEndpointSliceAdd(endpointSlice *discovery.EndpointSlice) {}
+
+// OnEndpointSliceUpdate is a noop handler for EndpointSlice updates.
+func (*NoopEndpointSliceHandler) OnEndpointSliceUpdate(oldEndpointSlice, newEndpointSlice *discovery.EndpointSlice) {
 }
+
+// OnEndpointSliceDelete is a noop handler for EndpointSlice deletes.
+func (*NoopEndpointSliceHandler) OnEndpointSliceDelete(endpointSlice *discovery.EndpointSlice) {}
+
+// OnEndpointSlicesSynced is a noop handler for EndpointSlice syncs.
+func (*NoopEndpointSliceHandler) OnEndpointSlicesSynced() {}
+
+var _ EndpointSliceHandler = &NoopEndpointSliceHandler{}
 
 // EndpointsConfig tracks a set of endpoints configurations.
-// It accepts "set", "add" and "remove" operations of endpoints via channels, and invokes registered handlers on change.
 type EndpointsConfig struct {
-	mux     *config.Mux
-	bcaster *config.Broadcaster
-	store   *endpointsStore
+	listerSynced  cache.InformerSynced
+	eventHandlers []EndpointsHandler
 }
 
 // NewEndpointsConfig creates a new EndpointsConfig.
-// It immediately runs the created EndpointsConfig.
-func NewEndpointsConfig() *EndpointsConfig {
-	// The updates channel is used to send interrupts to the Endpoints handler.
-	// It's buffered because we never want to block for as long as there is a
-	// pending interrupt, but don't want to drop them if the handler is doing
-	// work.
-	updates := make(chan struct{}, 1)
-	store := &endpointsStore{updates: updates, endpoints: make(map[string]map[types.NamespacedName]api.Endpoints)}
-	mux := config.NewMux(store)
-	bcaster := config.NewBroadcaster()
-	go watchForUpdates(bcaster, store, updates)
-	return &EndpointsConfig{mux, bcaster, store}
-}
-
-func (c *EndpointsConfig) RegisterHandler(handler EndpointsConfigHandler) {
-	c.bcaster.Add(config.ListenerFunc(func(instance interface{}) {
-		glog.V(3).Infof("Calling handler.OnEndpointsUpdate()")
-		handler.OnEndpointsUpdate(instance.([]api.Endpoints))
-	}))
-}
-
-func (c *EndpointsConfig) Channel(source string) chan EndpointsUpdate {
-	ch := c.mux.Channel(source)
-	endpointsCh := make(chan EndpointsUpdate)
-	go func() {
-		for update := range endpointsCh {
-			ch <- update
-		}
-		close(ch)
-	}()
-	return endpointsCh
-}
-
-func (c *EndpointsConfig) Config() []api.Endpoints {
-	return c.store.MergedState().([]api.Endpoints)
-}
-
-type endpointsStore struct {
-	endpointLock sync.RWMutex
-	endpoints    map[string]map[types.NamespacedName]api.Endpoints
-	updates      chan<- struct{}
-}
-
-func (s *endpointsStore) Merge(source string, change interface{}) error {
-	s.endpointLock.Lock()
-	endpoints := s.endpoints[source]
-	if endpoints == nil {
-		endpoints = make(map[types.NamespacedName]api.Endpoints)
+func NewEndpointsConfig(endpointsInformer coreinformers.EndpointsInformer, resyncPeriod time.Duration) *EndpointsConfig {
+	result := &EndpointsConfig{
+		listerSynced: endpointsInformer.Informer().HasSynced,
 	}
-	update := change.(EndpointsUpdate)
-	switch update.Op {
-	case ADD:
-		glog.V(5).Infof("Adding new endpoint from source %s : %s", source, spew.Sdump(update.Endpoints))
-		for _, value := range update.Endpoints {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			endpoints[name] = value
-		}
-	case REMOVE:
-		glog.V(5).Infof("Removing an endpoint %s", spew.Sdump(update))
-		for _, value := range update.Endpoints {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			delete(endpoints, name)
-		}
-	case SET:
-		glog.V(5).Infof("Setting endpoints %s", spew.Sdump(update))
-		// Clear the old map entries by just creating a new map
-		endpoints = make(map[types.NamespacedName]api.Endpoints)
-		for _, value := range update.Endpoints {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			endpoints[name] = value
-		}
-	default:
-		glog.V(4).Infof("Received invalid update type: %s", spew.Sdump(update))
+
+	endpointsInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    result.handleAddEndpoints,
+			UpdateFunc: result.handleUpdateEndpoints,
+			DeleteFunc: result.handleDeleteEndpoints,
+		},
+		resyncPeriod,
+	)
+
+	return result
+}
+
+// RegisterEventHandler registers a handler which is called on every endpoints change.
+func (c *EndpointsConfig) RegisterEventHandler(handler EndpointsHandler) {
+	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// Run waits for cache synced and invokes handlers after syncing.
+func (c *EndpointsConfig) Run(stopCh <-chan struct{}) {
+	klog.Info("Starting endpoints config controller")
+
+	if !cache.WaitForNamedCacheSync("endpoints config", stopCh, c.listerSynced) {
+		return
 	}
-	s.endpoints[source] = endpoints
-	s.endpointLock.Unlock()
-	if s.updates != nil {
-		// Since we record the snapshot before sending this signal, it's
-		// possible that the consumer ends up performing an extra update.
-		select {
-		case s.updates <- struct{}{}:
-		default:
-			glog.V(4).Infof("Endpoints handler already has a pending interrupt.")
+
+	for i := range c.eventHandlers {
+		klog.V(3).Infof("Calling handler.OnEndpointsSynced()")
+		c.eventHandlers[i].OnEndpointsSynced()
+	}
+}
+
+func (c *EndpointsConfig) handleAddEndpoints(obj interface{}) {
+	endpoints, ok := obj.(*v1.Endpoints)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointsAdd")
+		c.eventHandlers[i].OnEndpointsAdd(endpoints)
+	}
+}
+
+func (c *EndpointsConfig) handleUpdateEndpoints(oldObj, newObj interface{}) {
+	oldEndpoints, ok := oldObj.(*v1.Endpoints)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", oldObj))
+		return
+	}
+	endpoints, ok := newObj.(*v1.Endpoints)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", newObj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointsUpdate")
+		c.eventHandlers[i].OnEndpointsUpdate(oldEndpoints, endpoints)
+	}
+}
+
+func (c *EndpointsConfig) handleDeleteEndpoints(obj interface{}) {
+	endpoints, ok := obj.(*v1.Endpoints)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
+		}
+		if endpoints, ok = tombstone.Obj.(*v1.Endpoints); !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
 		}
 	}
-	return nil
+	for i := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointsDelete")
+		c.eventHandlers[i].OnEndpointsDelete(endpoints)
+	}
 }
 
-func (s *endpointsStore) MergedState() interface{} {
-	s.endpointLock.RLock()
-	defer s.endpointLock.RUnlock()
-	endpoints := make([]api.Endpoints, 0)
-	for _, sourceEndpoints := range s.endpoints {
-		for _, value := range sourceEndpoints {
-			endpoints = append(endpoints, value)
+// EndpointSliceConfig tracks a set of endpoints configurations.
+type EndpointSliceConfig struct {
+	listerSynced  cache.InformerSynced
+	eventHandlers []EndpointSliceHandler
+}
+
+// NewEndpointSliceConfig creates a new EndpointSliceConfig.
+func NewEndpointSliceConfig(endpointSliceInformer discoveryinformers.EndpointSliceInformer, resyncPeriod time.Duration) *EndpointSliceConfig {
+	result := &EndpointSliceConfig{
+		listerSynced: endpointSliceInformer.Informer().HasSynced,
+	}
+
+	endpointSliceInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    result.handleAddEndpointSlice,
+			UpdateFunc: result.handleUpdateEndpointSlice,
+			DeleteFunc: result.handleDeleteEndpointSlice,
+		},
+		resyncPeriod,
+	)
+
+	return result
+}
+
+// RegisterEventHandler registers a handler which is called on every endpoint slice change.
+func (c *EndpointSliceConfig) RegisterEventHandler(handler EndpointSliceHandler) {
+	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// Run waits for cache synced and invokes handlers after syncing.
+func (c *EndpointSliceConfig) Run(stopCh <-chan struct{}) {
+	klog.Info("Starting endpoint slice config controller")
+
+	if !cache.WaitForNamedCacheSync("endpoint slice config", stopCh, c.listerSynced) {
+		return
+	}
+
+	for _, h := range c.eventHandlers {
+		klog.V(3).Infof("Calling handler.OnEndpointSlicesSynced()")
+		h.OnEndpointSlicesSynced()
+	}
+}
+
+func (c *EndpointSliceConfig) handleAddEndpointSlice(obj interface{}) {
+	endpointSlice, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %T", obj))
+		return
+	}
+	for _, h := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointSliceAdd %+v", endpointSlice)
+		h.OnEndpointSliceAdd(endpointSlice)
+	}
+}
+
+func (c *EndpointSliceConfig) handleUpdateEndpointSlice(oldObj, newObj interface{}) {
+	oldEndpointSlice, ok := oldObj.(*discovery.EndpointSlice)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %T", newObj))
+		return
+	}
+	newEndpointSlice, ok := newObj.(*discovery.EndpointSlice)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %T", newObj))
+		return
+	}
+	for _, h := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointSliceUpdate")
+		h.OnEndpointSliceUpdate(oldEndpointSlice, newEndpointSlice)
+	}
+}
+
+func (c *EndpointSliceConfig) handleDeleteEndpointSlice(obj interface{}) {
+	endpointSlice, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %T", obj))
+			return
+		}
+		if endpointSlice, ok = tombstone.Obj.(*discovery.EndpointSlice); !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %T", obj))
+			return
 		}
 	}
-	return endpoints
+	for _, h := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnEndpointsDelete")
+		h.OnEndpointSliceDelete(endpointSlice)
+	}
 }
 
 // ServiceConfig tracks a set of service configurations.
-// It accepts "set", "add" and "remove" operations of services via channels, and invokes registered handlers on change.
 type ServiceConfig struct {
-	mux     *config.Mux
-	bcaster *config.Broadcaster
-	store   *serviceStore
+	listerSynced  cache.InformerSynced
+	eventHandlers []ServiceHandler
 }
 
 // NewServiceConfig creates a new ServiceConfig.
-// It immediately runs the created ServiceConfig.
-func NewServiceConfig() *ServiceConfig {
-	// The updates channel is used to send interrupts to the Services handler.
-	// It's buffered because we never want to block for as long as there is a
-	// pending interrupt, but don't want to drop them if the handler is doing
-	// work.
-	updates := make(chan struct{}, 1)
-	store := &serviceStore{updates: updates, services: make(map[string]map[types.NamespacedName]api.Service)}
-	mux := config.NewMux(store)
-	bcaster := config.NewBroadcaster()
-	go watchForUpdates(bcaster, store, updates)
-	return &ServiceConfig{mux, bcaster, store}
-}
-
-func (c *ServiceConfig) RegisterHandler(handler ServiceConfigHandler) {
-	c.bcaster.Add(config.ListenerFunc(func(instance interface{}) {
-		glog.V(3).Infof("Calling handler.OnServiceUpdate()")
-		handler.OnServiceUpdate(instance.([]api.Service))
-	}))
-}
-
-func (c *ServiceConfig) Channel(source string) chan ServiceUpdate {
-	ch := c.mux.Channel(source)
-	serviceCh := make(chan ServiceUpdate)
-	go func() {
-		for update := range serviceCh {
-			ch <- update
-		}
-		close(ch)
-	}()
-	return serviceCh
-}
-
-func (c *ServiceConfig) Config() []api.Service {
-	return c.store.MergedState().([]api.Service)
-}
-
-type serviceStore struct {
-	serviceLock sync.RWMutex
-	services    map[string]map[types.NamespacedName]api.Service
-	updates     chan<- struct{}
-}
-
-func (s *serviceStore) Merge(source string, change interface{}) error {
-	s.serviceLock.Lock()
-	services := s.services[source]
-	if services == nil {
-		services = make(map[types.NamespacedName]api.Service)
+func NewServiceConfig(serviceInformer coreinformers.ServiceInformer, resyncPeriod time.Duration) *ServiceConfig {
+	result := &ServiceConfig{
+		listerSynced: serviceInformer.Informer().HasSynced,
 	}
-	update := change.(ServiceUpdate)
-	switch update.Op {
-	case ADD:
-		glog.V(5).Infof("Adding new service from source %s : %s", source, spew.Sdump(update.Services))
-		for _, value := range update.Services {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			services[name] = value
-		}
-	case REMOVE:
-		glog.V(5).Infof("Removing a service %s", spew.Sdump(update))
-		for _, value := range update.Services {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			delete(services, name)
-		}
-	case SET:
-		glog.V(5).Infof("Setting services %s", spew.Sdump(update))
-		// Clear the old map entries by just creating a new map
-		services = make(map[types.NamespacedName]api.Service)
-		for _, value := range update.Services {
-			name := types.NamespacedName{Namespace: value.Namespace, Name: value.Name}
-			services[name] = value
-		}
-	default:
-		glog.V(4).Infof("Received invalid update type: %s", spew.Sdump(update))
+
+	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    result.handleAddService,
+			UpdateFunc: result.handleUpdateService,
+			DeleteFunc: result.handleDeleteService,
+		},
+		resyncPeriod,
+	)
+
+	return result
+}
+
+// RegisterEventHandler registers a handler which is called on every service change.
+func (c *ServiceConfig) RegisterEventHandler(handler ServiceHandler) {
+	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// Run waits for cache synced and invokes handlers after syncing.
+func (c *ServiceConfig) Run(stopCh <-chan struct{}) {
+	klog.Info("Starting service config controller")
+
+	if !cache.WaitForNamedCacheSync("service config", stopCh, c.listerSynced) {
+		return
 	}
-	s.services[source] = services
-	s.serviceLock.Unlock()
-	if s.updates != nil {
-		// Since we record the snapshot before sending this signal, it's
-		// possible that the consumer ends up performing an extra update.
-		select {
-		case s.updates <- struct{}{}:
-		default:
-			glog.V(4).Infof("Service handler already has a pending interrupt.")
+
+	for i := range c.eventHandlers {
+		klog.V(3).Info("Calling handler.OnServiceSynced()")
+		c.eventHandlers[i].OnServiceSynced()
+	}
+}
+
+func (c *ServiceConfig) handleAddService(obj interface{}) {
+	service, ok := obj.(*v1.Service)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).Info("Calling handler.OnServiceAdd")
+		c.eventHandlers[i].OnServiceAdd(service)
+	}
+}
+
+func (c *ServiceConfig) handleUpdateService(oldObj, newObj interface{}) {
+	oldService, ok := oldObj.(*v1.Service)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", oldObj))
+		return
+	}
+	service, ok := newObj.(*v1.Service)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", newObj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).Info("Calling handler.OnServiceUpdate")
+		c.eventHandlers[i].OnServiceUpdate(oldService, service)
+	}
+}
+
+func (c *ServiceConfig) handleDeleteService(obj interface{}) {
+	service, ok := obj.(*v1.Service)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
+		}
+		if service, ok = tombstone.Obj.(*v1.Service); !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
 		}
 	}
-	return nil
+	for i := range c.eventHandlers {
+		klog.V(4).Info("Calling handler.OnServiceDelete")
+		c.eventHandlers[i].OnServiceDelete(service)
+	}
 }
 
-func (s *serviceStore) MergedState() interface{} {
-	s.serviceLock.RLock()
-	defer s.serviceLock.RUnlock()
-	services := make([]api.Service, 0)
-	for _, sourceServices := range s.services {
-		for _, value := range sourceServices {
-			services = append(services, value)
+// NodeHandler is an abstract interface of objects which receive
+// notifications about node object changes.
+type NodeHandler interface {
+	// OnNodeAdd is called whenever creation of new node object
+	// is observed.
+	OnNodeAdd(node *v1.Node)
+	// OnNodeUpdate is called whenever modification of an existing
+	// node object is observed.
+	OnNodeUpdate(oldNode, node *v1.Node)
+	// OnNodeDelete is called whenever deletion of an existing node
+	// object is observed.
+	OnNodeDelete(node *v1.Node)
+	// OnNodeSynced is called once all the initial event handlers were
+	// called and the state is fully propagated to local cache.
+	OnNodeSynced()
+}
+
+// NoopNodeHandler is a noop handler for proxiers that have not yet
+// implemented a full NodeHandler.
+type NoopNodeHandler struct{}
+
+// OnNodeAdd is a noop handler for Node creates.
+func (*NoopNodeHandler) OnNodeAdd(node *v1.Node) {}
+
+// OnNodeUpdate is a noop handler for Node updates.
+func (*NoopNodeHandler) OnNodeUpdate(oldNode, node *v1.Node) {}
+
+// OnNodeDelete is a noop handler for Node deletes.
+func (*NoopNodeHandler) OnNodeDelete(node *v1.Node) {}
+
+// OnNodeSynced is a noop handler for Node syncs.
+func (*NoopNodeHandler) OnNodeSynced() {}
+
+var _ NodeHandler = &NoopNodeHandler{}
+
+// NodeConfig tracks a set of node configurations.
+// It accepts "set", "add" and "remove" operations of node via channels, and invokes registered handlers on change.
+type NodeConfig struct {
+	listerSynced  cache.InformerSynced
+	eventHandlers []NodeHandler
+}
+
+// NewNodeConfig creates a new NodeConfig.
+func NewNodeConfig(nodeInformer coreinformers.NodeInformer, resyncPeriod time.Duration) *NodeConfig {
+	result := &NodeConfig{
+		listerSynced: nodeInformer.Informer().HasSynced,
+	}
+
+	nodeInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    result.handleAddNode,
+			UpdateFunc: result.handleUpdateNode,
+			DeleteFunc: result.handleDeleteNode,
+		},
+		resyncPeriod,
+	)
+
+	return result
+}
+
+// RegisterEventHandler registers a handler which is called on every node change.
+func (c *NodeConfig) RegisterEventHandler(handler NodeHandler) {
+	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// Run starts the goroutine responsible for calling registered handlers.
+func (c *NodeConfig) Run(stopCh <-chan struct{}) {
+	klog.Info("Starting node config controller")
+
+	if !cache.WaitForNamedCacheSync("node config", stopCh, c.listerSynced) {
+		return
+	}
+
+	for i := range c.eventHandlers {
+		klog.V(3).Infof("Calling handler.OnNodeSynced()")
+		c.eventHandlers[i].OnNodeSynced()
+	}
+}
+
+func (c *NodeConfig) handleAddNode(obj interface{}) {
+	node, ok := obj.(*v1.Node)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnNodeAdd")
+		c.eventHandlers[i].OnNodeAdd(node)
+	}
+}
+
+func (c *NodeConfig) handleUpdateNode(oldObj, newObj interface{}) {
+	oldNode, ok := oldObj.(*v1.Node)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", oldObj))
+		return
+	}
+	node, ok := newObj.(*v1.Node)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", newObj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(5).Infof("Calling handler.OnNodeUpdate")
+		c.eventHandlers[i].OnNodeUpdate(oldNode, node)
+	}
+}
+
+func (c *NodeConfig) handleDeleteNode(obj interface{}) {
+	node, ok := obj.(*v1.Node)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
+		}
+		if node, ok = tombstone.Obj.(*v1.Node); !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
 		}
 	}
-	return services
-}
-
-// watchForUpdates invokes bcaster.Notify() with the latest version of an object
-// when changes occur.
-func watchForUpdates(bcaster *config.Broadcaster, accessor config.Accessor, updates <-chan struct{}) {
-	for true {
-		<-updates
-		bcaster.Notify(accessor.MergedState())
+	for i := range c.eventHandlers {
+		klog.V(4).Infof("Calling handler.OnNodeDelete")
+		c.eventHandlers[i].OnNodeDelete(node)
 	}
 }

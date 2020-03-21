@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -72,7 +72,7 @@ var (
 )
 
 func newWalkFunc(invalidLink *bool, client *http.Client) filepath.WalkFunc {
-	return func(filePath string, info os.FileInfo, err error) error {
+	return func(filePath string, info os.FileInfo, initErr error) error {
 		hasSuffix := false
 		for _, suffix := range *fileSuffix {
 			hasSuffix = hasSuffix || strings.HasSuffix(info.Name(), suffix)
@@ -129,7 +129,10 @@ func newWalkFunc(invalidLink *bool, client *http.Client) filepath.WalkFunc {
 				if err != nil {
 					break
 				}
-				if resp.StatusCode == 429 {
+				// This header is used in 301, 429 and 503.
+				// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
+				// And Go client will follow redirects automatically so the 301 check is probably unnecessary.
+				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 					retryAfter := resp.Header.Get("Retry-After")
 					if seconds, err := strconv.Atoi(retryAfter); err != nil {
 						backoff = seconds + 10
@@ -138,7 +141,7 @@ func newWalkFunc(invalidLink *bool, client *http.Client) filepath.WalkFunc {
 					time.Sleep(time.Duration(backoff) * time.Second)
 					backoff *= 2
 					retry++
-				} else if resp.StatusCode == 404 {
+				} else if resp.StatusCode == http.StatusNotFound {
 					// We only check for 404 error for now. 401, 403 errors are hard to handle.
 
 					// We need to try a GET to avoid false alert.
@@ -146,7 +149,7 @@ func newWalkFunc(invalidLink *bool, client *http.Client) filepath.WalkFunc {
 					if err != nil {
 						break
 					}
-					if resp.StatusCode != 404 {
+					if resp.StatusCode != http.StatusNotFound {
 						continue URL
 					}
 

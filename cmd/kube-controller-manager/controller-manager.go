@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,36 +21,29 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
+	"math/rand"
 	"os"
-	"runtime"
+	"time"
 
+	"k8s.io/component-base/logs"
+	_ "k8s.io/component-base/metrics/prometheus/clientgo" // load all the prometheus client-go plugin
+	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/kubernetes/cmd/kube-controller-manager/app"
-	"k8s.io/kubernetes/cmd/kube-controller-manager/app/options"
-	"k8s.io/kubernetes/pkg/healthz"
-	"k8s.io/kubernetes/pkg/util"
-	"k8s.io/kubernetes/pkg/version/verflag"
-
-	"github.com/spf13/pflag"
 )
 
-func init() {
-	healthz.DefaultHealthz()
-}
-
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	s := options.NewCMServer()
-	s.AddFlags(pflag.CommandLine)
+	rand.Seed(time.Now().UnixNano())
 
-	util.InitFlags()
-	util.InitLogs()
-	defer util.FlushLogs()
+	command := app.NewControllerManagerCommand()
 
-	verflag.PrintAndExitIfRequested()
+	// TODO: once we switch everything over to Cobra commands, we can go back to calling
+	// utilflag.InitFlags() (by removing its pflag.Parse() call). For now, we have to set the
+	// normalize func and add the go flag set by hand.
+	// utilflag.InitFlags()
+	logs.InitLogs()
+	defer logs.FlushLogs()
 
-	if err := app.Run(s); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+	if err := command.Execute(); err != nil {
 		os.Exit(1)
 	}
 }

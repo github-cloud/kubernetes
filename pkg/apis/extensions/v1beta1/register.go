@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,75 +17,29 @@ limitations under the License.
 package v1beta1
 
 import (
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/runtime"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // GroupName is the group name use in this package
 const GroupName = "extensions"
 
 // SchemeGroupVersion is group version used to register these objects
-var SchemeGroupVersion = unversioned.GroupVersion{Group: GroupName, Version: "v1beta1"}
+var SchemeGroupVersion = schema.GroupVersion{Group: GroupName, Version: "v1beta1"}
 
-func AddToScheme(scheme *runtime.Scheme) {
-	addKnownTypes(scheme)
-	addDefaultingFuncs(scheme)
-	addConversionFuncs(scheme)
+// Resource takes an unqualified resource and returns a Group qualified GroupResource
+func Resource(resource string) schema.GroupResource {
+	return SchemeGroupVersion.WithResource(resource).GroupResource()
 }
 
-// Adds the list of known types to api.Scheme.
-func addKnownTypes(scheme *runtime.Scheme) {
-	scheme.AddKnownTypes(SchemeGroupVersion,
-		&ClusterAutoscaler{},
-		&ClusterAutoscalerList{},
-		&Deployment{},
-		&DeploymentList{},
-		&DeploymentRollback{},
-		&HorizontalPodAutoscaler{},
-		&HorizontalPodAutoscalerList{},
-		&Job{},
-		&JobList{},
-		&ReplicationControllerDummy{},
-		&Scale{},
-		&ThirdPartyResource{},
-		&ThirdPartyResourceList{},
-		&DaemonSetList{},
-		&DaemonSet{},
-		&ThirdPartyResourceData{},
-		&ThirdPartyResourceDataList{},
-		&Ingress{},
-		&IngressList{},
-		&ListOptions{},
-		&v1.DeleteOptions{},
-		&ReplicaSet{},
-		&ReplicaSetList{},
-		&PodSecurityPolicy{},
-		&PodSecurityPolicyList{},
-	)
-}
+var (
+	localSchemeBuilder = &extensionsv1beta1.SchemeBuilder
+	AddToScheme        = localSchemeBuilder.AddToScheme
+)
 
-func (obj *ClusterAutoscaler) GetObjectKind() unversioned.ObjectKind           { return &obj.TypeMeta }
-func (obj *ClusterAutoscalerList) GetObjectKind() unversioned.ObjectKind       { return &obj.TypeMeta }
-func (obj *Deployment) GetObjectKind() unversioned.ObjectKind                  { return &obj.TypeMeta }
-func (obj *DeploymentList) GetObjectKind() unversioned.ObjectKind              { return &obj.TypeMeta }
-func (obj *DeploymentRollback) GetObjectKind() unversioned.ObjectKind          { return &obj.TypeMeta }
-func (obj *HorizontalPodAutoscaler) GetObjectKind() unversioned.ObjectKind     { return &obj.TypeMeta }
-func (obj *HorizontalPodAutoscalerList) GetObjectKind() unversioned.ObjectKind { return &obj.TypeMeta }
-func (obj *Job) GetObjectKind() unversioned.ObjectKind                         { return &obj.TypeMeta }
-func (obj *JobList) GetObjectKind() unversioned.ObjectKind                     { return &obj.TypeMeta }
-func (obj *ReplicationControllerDummy) GetObjectKind() unversioned.ObjectKind  { return &obj.TypeMeta }
-func (obj *Scale) GetObjectKind() unversioned.ObjectKind                       { return &obj.TypeMeta }
-func (obj *ThirdPartyResource) GetObjectKind() unversioned.ObjectKind          { return &obj.TypeMeta }
-func (obj *ThirdPartyResourceList) GetObjectKind() unversioned.ObjectKind      { return &obj.TypeMeta }
-func (obj *DaemonSet) GetObjectKind() unversioned.ObjectKind                   { return &obj.TypeMeta }
-func (obj *DaemonSetList) GetObjectKind() unversioned.ObjectKind               { return &obj.TypeMeta }
-func (obj *ThirdPartyResourceData) GetObjectKind() unversioned.ObjectKind      { return &obj.TypeMeta }
-func (obj *ThirdPartyResourceDataList) GetObjectKind() unversioned.ObjectKind  { return &obj.TypeMeta }
-func (obj *Ingress) GetObjectKind() unversioned.ObjectKind                     { return &obj.TypeMeta }
-func (obj *IngressList) GetObjectKind() unversioned.ObjectKind                 { return &obj.TypeMeta }
-func (obj *ListOptions) GetObjectKind() unversioned.ObjectKind                 { return &obj.TypeMeta }
-func (obj *ReplicaSet) GetObjectKind() unversioned.ObjectKind                  { return &obj.TypeMeta }
-func (obj *ReplicaSetList) GetObjectKind() unversioned.ObjectKind              { return &obj.TypeMeta }
-func (obj *PodSecurityPolicy) GetObjectKind() unversioned.ObjectKind           { return &obj.TypeMeta }
-func (obj *PodSecurityPolicyList) GetObjectKind() unversioned.ObjectKind       { return &obj.TypeMeta }
+func init() {
+	// We only register manually written functions here. The registration of the
+	// generated functions takes place in the generated files. The separation
+	// makes the code compile even when the generated files are missing.
+	localSchemeBuilder.Register(addDefaultingFuncs)
+}

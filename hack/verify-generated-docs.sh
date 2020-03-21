@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2014 The Kubernetes Authors All rights reserved.
+# Copyright 2014 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,17 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script checks that various type of documents(* .md, * .yaml and man
+# files) are generated correctly(just verifies the generation process).
+# Usage: `hack/verify-generated-docs.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::golang::setup_env
 
-"${KUBE_ROOT}/hack/build-go.sh" cmd/gendocs cmd/genkubedocs cmd/genman cmd/genbashcomp cmd/mungedocs
+BINS=(
+	cmd/gendocs
+	cmd/genkubedocs
+	cmd/genman
+	cmd/genyaml
+)
+make -C "${KUBE_ROOT}" WHAT="${BINS[*]}"
 
-"${KUBE_ROOT}/hack/after-build/verify-generated-docs.sh" "$@"
+kube::util::ensure-temp-dir
 
-# ex: ts=2 sw=2 et filetype=sh
+# just verify the generation process
+kube::util::gen-docs "${KUBE_TEMP}"

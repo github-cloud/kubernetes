@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,32 +14,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Common logic used by both http and file channels.
 package config
 
 import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/helper"
+	"k8s.io/kubernetes/pkg/features"
+
+	// TODO: remove this import if
+	// api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String() is changed
+	// to "v1"?
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	// Ensure that core apis are installed
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util/hash"
-	utilyaml "k8s.io/kubernetes/pkg/util/yaml"
 
-	"github.com/golang/glog"
+	"k8s.io/klog"
+)
+
+const (
+	maxConfigLength = 10 * 1 << 20 // 10MB
 )
 
 // Generate a pod name that is unique among nodes by appending the nodeName.
-func generatePodName(name, nodeName string) string {
-	return fmt.Sprintf("%s-%s", name, nodeName)
+func generatePodName(name string, nodeName types.NodeName) string {
+	return fmt.Sprintf("%s-%s", name, strings.ToLower(string(nodeName)))
 }
 
-func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName string) error {
+func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName types.NodeName) error {
 	if len(pod.UID) == 0 {
 		hasher := md5.New()
 		if isFile {
@@ -50,19 +66,19 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName string) er
 		}
 		hash.DeepHashObject(hasher, pod)
 		pod.UID = types.UID(hex.EncodeToString(hasher.Sum(nil)[0:]))
-		glog.V(5).Infof("Generated UID %q pod %q from %s", pod.UID, pod.Name, source)
+		klog.V(5).Infof("Generated UID %q pod %q from %s", pod.UID, pod.Name, source)
 	}
 
 	pod.Name = generatePodName(pod.Name, nodeName)
-	glog.V(5).Infof("Generated Name %q for UID %q from URL %s", pod.Name, pod.UID, source)
+	klog.V(5).Infof("Generated Name %q for UID %q from URL %s", pod.Name, pod.UID, source)
 
 	if pod.Namespace == "" {
-		pod.Namespace = kubetypes.NamespaceDefault
+		pod.Namespace = metav1.NamespaceDefault
 	}
-	glog.V(5).Infof("Using namespace %q for pod %q from %s", pod.Namespace, pod.Name, source)
+	klog.V(5).Infof("Using namespace %q for pod %q from %s", pod.Namespace, pod.Name, source)
 
 	// Set the Host field to indicate this pod is scheduled on the current node.
-	pod.Spec.NodeName = nodeName
+	pod.Spec.NodeName = string(nodeName)
 
 	pod.ObjectMeta.SelfLink = getSelfLink(pod.Name, pod.Namespace)
 
@@ -72,6 +88,15 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName string) er
 	// The generated UID is the hash of the file.
 	pod.Annotations[kubetypes.ConfigHashAnnotationKey] = string(pod.UID)
 
+	if isFile {
+		// Applying the default Taint tolerations to static pods,
+		// so they are not evicted when there are node problems.
+		helper.AddOrUpdateTolerationInPod(pod, &api.Toleration{
+			Operator: "Exists",
+			Effect:   api.TaintEffectNoExecute,
+		})
+	}
+
 	// Set the default status to pending.
 	pod.Status.Phase = api.PodPending
 	return nil
@@ -80,62 +105,81 @@ func applyDefaults(pod *api.Pod, source string, isFile bool, nodeName string) er
 func getSelfLink(name, namespace string) string {
 	var selfLink string
 	if len(namespace) == 0 {
-		namespace = api.NamespaceDefault
+		namespace = metav1.NamespaceDefault
 	}
-	selfLink = fmt.Sprintf("/api/"+registered.GroupOrDie(api.GroupName).GroupVersion.Version+"/pods/namespaces/%s/%s", name, namespace)
+	selfLink = fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", namespace, name)
 	return selfLink
 }
 
 type defaultFunc func(pod *api.Pod) error
 
-func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *api.Pod, err error) {
+// tryDecodeSinglePod takes data and tries to extract valid Pod config information from it.
+func tryDecodeSinglePod(data []byte, defaultFn defaultFunc) (parsed bool, pod *v1.Pod, err error) {
 	// JSON is valid YAML, so this should work for everything.
 	json, err := utilyaml.ToJSON(data)
 	if err != nil {
 		return false, nil, err
 	}
-	obj, err := runtime.Decode(api.Codecs.UniversalDecoder(), json)
+	obj, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), json)
 	if err != nil {
 		return false, pod, err
 	}
+
+	newPod, ok := obj.(*api.Pod)
 	// Check whether the object could be converted to single pod.
-	if _, ok := obj.(*api.Pod); !ok {
-		err = fmt.Errorf("invalid pod: %+v", obj)
-		return false, pod, err
+	if !ok {
+		return false, pod, fmt.Errorf("invalid pod: %#v", obj)
 	}
-	newPod := obj.(*api.Pod)
+
 	// Apply default values and validate the pod.
 	if err = defaultFn(newPod); err != nil {
 		return true, pod, err
 	}
-	if errs := validation.ValidatePod(newPod); len(errs) > 0 {
-		err = fmt.Errorf("invalid pod: %v", errs)
-		return true, pod, err
+	opts := validation.PodValidationOptions{
+		AllowMultipleHugePageResources: utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
 	}
-	return true, newPod, nil
+	if errs := validation.ValidatePod(newPod, opts); len(errs) > 0 {
+		return true, pod, fmt.Errorf("invalid pod: %v", errs)
+	}
+	v1Pod := &v1.Pod{}
+	if err := k8s_api_v1.Convert_core_Pod_To_v1_Pod(newPod, v1Pod, nil); err != nil {
+		klog.Errorf("Pod %q failed to convert to v1", newPod.Name)
+		return true, nil, err
+	}
+	return true, v1Pod, nil
 }
 
-func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods api.PodList, err error) {
-	obj, err := runtime.Decode(api.Codecs.UniversalDecoder(), data)
+func tryDecodePodList(data []byte, defaultFn defaultFunc) (parsed bool, pods v1.PodList, err error) {
+	obj, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), data)
 	if err != nil {
 		return false, pods, err
 	}
+
+	newPods, ok := obj.(*api.PodList)
 	// Check whether the object could be converted to list of pods.
-	if _, ok := obj.(*api.PodList); !ok {
+	if !ok {
 		err = fmt.Errorf("invalid pods list: %#v", obj)
 		return false, pods, err
 	}
-	newPods := obj.(*api.PodList)
+
+	opts := validation.PodValidationOptions{
+		AllowMultipleHugePageResources: utilfeature.DefaultFeatureGate.Enabled(features.HugePageStorageMediumSize),
+	}
+
 	// Apply default values and validate pods.
 	for i := range newPods.Items {
 		newPod := &newPods.Items[i]
 		if err = defaultFn(newPod); err != nil {
 			return true, pods, err
 		}
-		if errs := validation.ValidatePod(newPod); len(errs) > 0 {
+		if errs := validation.ValidatePod(newPod, opts); len(errs) > 0 {
 			err = fmt.Errorf("invalid pod: %v", errs)
 			return true, pods, err
 		}
 	}
-	return true, *newPods, err
+	v1Pods := &v1.PodList{}
+	if err := k8s_api_v1.Convert_core_PodList_To_v1_PodList(newPods, v1Pods, nil); err != nil {
+		return true, pods, err
+	}
+	return true, *v1Pods, err
 }

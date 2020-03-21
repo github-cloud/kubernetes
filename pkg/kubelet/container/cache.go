@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors All rights reserved.
+Copyright 2015 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Cache stores the PodStatus for the pods. It represents *all* the visible
@@ -30,7 +30,7 @@ import (
 // has no states known by the runtime, Cache returns an empty PodStatus object
 // with ID populated.
 //
-// Cache provides two methods to retrive the PodStatus: the non-blocking Get()
+// Cache provides two methods to retrieve the PodStatus: the non-blocking Get()
 // and the blocking GetNewerThan() method. The component responsible for
 // populating the cache is expected to call Delete() to explicitly free the
 // cache entries.
@@ -49,7 +49,7 @@ type data struct {
 	status *PodStatus
 	// Error got when trying to inspect the pod.
 	err error
-	// Time when the data was last modfied.
+	// Time when the data was last modified.
 	modified time.Time
 }
 
@@ -189,7 +189,7 @@ func (c *cache) subscribe(id types.UID, timestamp time.Time) chan *data {
 	defer c.lock.Unlock()
 	d := c.getIfNewerThan(id, timestamp)
 	if d != nil {
-		// If the cache entry is ready, send the data and return immediatly.
+		// If the cache entry is ready, send the data and return immediately.
 		ch <- d
 		return ch
 	}

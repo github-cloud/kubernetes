@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors All rights reserved.
+Copyright 2016 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,25 +16,31 @@ limitations under the License.
 
 package stats
 
-import "time"
+import (
+	"time"
+)
 
 // ResourceAnalyzer provides statistics on node resource consumption
 type ResourceAnalyzer interface {
 	Start()
 
 	fsResourceAnalyzerInterface
+	SummaryProvider
 }
 
 // resourceAnalyzer implements ResourceAnalyzer
 type resourceAnalyzer struct {
 	*fsResourceAnalyzer
+	SummaryProvider
 }
 
 var _ ResourceAnalyzer = &resourceAnalyzer{}
 
 // NewResourceAnalyzer returns a new ResourceAnalyzer
-func NewResourceAnalyzer(statsProvider StatsProvider, calVolumeFrequency time.Duration) ResourceAnalyzer {
-	return &resourceAnalyzer{newFsResourceAnalyzer(statsProvider, calVolumeFrequency)}
+func NewResourceAnalyzer(statsProvider Provider, calVolumeFrequency time.Duration) ResourceAnalyzer {
+	fsAnalyzer := newFsResourceAnalyzer(statsProvider, calVolumeFrequency)
+	summaryProvider := NewSummaryProvider(statsProvider)
+	return &resourceAnalyzer{fsAnalyzer, summaryProvider}
 }
 
 // Start starts background functions necessary for the ResourceAnalyzer to function

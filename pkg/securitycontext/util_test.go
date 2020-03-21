@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors All rights reserved.
+Copyright 2014 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,190 +17,106 @@ limitations under the License.
 package securitycontext
 
 import (
+	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/api/core/v1"
 )
 
-func TestParseSELinuxOptions(t *testing.T) {
-	cases := []struct {
-		name     string
-		input    string
-		expected *api.SELinuxOptions
-	}{
-		{
-			name:  "simple",
-			input: "user_t:role_t:type_t:s0",
-			expected: &api.SELinuxOptions{
-				User:  "user_t",
-				Role:  "role_t",
-				Type:  "type_t",
-				Level: "s0",
-			},
-		},
-		{
-			name:  "simple + categories",
-			input: "user_t:role_t:type_t:s0:c0",
-			expected: &api.SELinuxOptions{
-				User:  "user_t",
-				Role:  "role_t",
-				Type:  "type_t",
-				Level: "s0:c0",
-			},
-		},
-		{
-			name:  "not enough fields",
-			input: "type_t:s0:c0",
-		},
-	}
-
-	for _, tc := range cases {
-		result, err := ParseSELinuxOptions(tc.input)
-
-		if err != nil {
-			if tc.expected == nil {
-				continue
-			} else {
-				t.Errorf("%v: unexpected error: %v", tc.name, err)
-			}
-		}
-
-		compareContexts(tc.name, tc.expected, result, t)
-	}
-}
-
-func compareContexts(name string, ex, ac *api.SELinuxOptions, t *testing.T) {
-	if e, a := ex.User, ac.User; e != a {
-		t.Errorf("%v: expected user: %v, got: %v", name, e, a)
-	}
-	if e, a := ex.Role, ac.Role; e != a {
-		t.Errorf("%v: expected role: %v, got: %v", name, e, a)
-	}
-	if e, a := ex.Type, ac.Type; e != a {
-		t.Errorf("%v: expected type: %v, got: %v", name, e, a)
-	}
-	if e, a := ex.Level, ac.Level; e != a {
-		t.Errorf("%v: expected level: %v, got: %v", name, e, a)
-	}
-}
-
-func TestHaRootUID(t *testing.T) {
-	var nonRoot int64 = 1
-	var root int64 = 0
+func TestAddNoNewPrivileges(t *testing.T) {
+	pfalse := false
+	ptrue := true
 
 	tests := map[string]struct {
-		container *api.Container
-		expect    bool
+		sc     *v1.SecurityContext
+		expect bool
 	}{
-		"nil sc": {
-			container: &api.Container{SecurityContext: nil},
+		"allowPrivilegeEscalation nil security context nil": {
+			sc:     nil,
+			expect: false,
 		},
-		"nil runAsuser": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: nil,
-				},
+		"allowPrivilegeEscalation nil": {
+			sc: &v1.SecurityContext{
+				AllowPrivilegeEscalation: nil,
 			},
+			expect: false,
 		},
-		"runAsUser non-root": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: &nonRoot,
-				},
-			},
-		},
-		"runAsUser root": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: &root,
-				},
+		"allowPrivilegeEscalation false": {
+			sc: &v1.SecurityContext{
+				AllowPrivilegeEscalation: &pfalse,
 			},
 			expect: true,
+		},
+		"allowPrivilegeEscalation true": {
+			sc: &v1.SecurityContext{
+				AllowPrivilegeEscalation: &ptrue,
+			},
+			expect: false,
 		},
 	}
 
 	for k, v := range tests {
-		actual := HasRootUID(v.container)
+		actual := AddNoNewPrivileges(v.sc)
 		if actual != v.expect {
 			t.Errorf("%s failed, expected %t but received %t", k, v.expect, actual)
 		}
 	}
 }
 
-func TestHasRunAsUser(t *testing.T) {
-	var runAsUser int64 = 0
-
+func TestConvertToRuntimeMaskedPaths(t *testing.T) {
+	dPM := v1.DefaultProcMount
+	uPM := v1.UnmaskedProcMount
 	tests := map[string]struct {
-		container *api.Container
-		expect    bool
+		pm     *v1.ProcMountType
+		expect []string
 	}{
-		"nil sc": {
-			container: &api.Container{SecurityContext: nil},
+		"procMount nil": {
+			pm:     nil,
+			expect: defaultMaskedPaths,
 		},
-		"nil runAsUser": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: nil,
-				},
-			},
+		"procMount default": {
+			pm:     &dPM,
+			expect: defaultMaskedPaths,
 		},
-		"valid runAsUser": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: &runAsUser,
-				},
-			},
-			expect: true,
+		"procMount unmasked": {
+			pm:     &uPM,
+			expect: []string{},
 		},
 	}
 
 	for k, v := range tests {
-		actual := HasRunAsUser(v.container)
-		if actual != v.expect {
-			t.Errorf("%s failed, expected %t but received %t", k, v.expect, actual)
+		actual := ConvertToRuntimeMaskedPaths(v.pm)
+		if !reflect.DeepEqual(actual, v.expect) {
+			t.Errorf("%s failed, expected %#v but received %#v", k, v.expect, actual)
 		}
 	}
 }
 
-func TestHasRootRunAsUser(t *testing.T) {
-	var nonRoot int64 = 1
-	var root int64 = 0
-
+func TestConvertToRuntimeReadonlyPaths(t *testing.T) {
+	dPM := v1.DefaultProcMount
+	uPM := v1.UnmaskedProcMount
 	tests := map[string]struct {
-		container *api.Container
-		expect    bool
+		pm     *v1.ProcMountType
+		expect []string
 	}{
-		"nil sc": {
-			container: &api.Container{SecurityContext: nil},
+		"procMount nil": {
+			pm:     nil,
+			expect: defaultReadonlyPaths,
 		},
-		"nil runAsuser": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: nil,
-				},
-			},
+		"procMount default": {
+			pm:     &dPM,
+			expect: defaultReadonlyPaths,
 		},
-		"runAsUser non-root": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: &nonRoot,
-				},
-			},
-		},
-		"runAsUser root": {
-			container: &api.Container{
-				SecurityContext: &api.SecurityContext{
-					RunAsUser: &root,
-				},
-			},
-			expect: true,
+		"procMount unmasked": {
+			pm:     &uPM,
+			expect: []string{},
 		},
 	}
 
 	for k, v := range tests {
-		actual := HasRootRunAsUser(v.container)
-		if actual != v.expect {
-			t.Errorf("%s failed, expected %t but received %t", k, v.expect, actual)
+		actual := ConvertToRuntimeReadonlyPaths(v.pm)
+		if !reflect.DeepEqual(actual, v.expect) {
+			t.Errorf("%s failed, expected %#v but received %#v", k, v.expect, actual)
 		}
 	}
 }
